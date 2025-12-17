@@ -1,0 +1,3 @@
+echo aiogram==3.23.0 > requirements.txt
+echo python-dotenv==1.0.0 >> requirements.txt
+echo aiosqlite==0.20.0 >> requirements.txt
