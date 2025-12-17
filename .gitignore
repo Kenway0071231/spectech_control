@@ -1,27 +1,49 @@
-# 1. Файлы с паролями и ключами
+# 1. ФАЙЛЫ С СЕКРЕТАМИ И ПАРОЛЯМИ
 .env
 .env.local
 secrets.txt
+*.key
+*.pem
 
-# 2. Файлы баз данных (готовые, с данными)
+# 2. ФАЙЛЫ БАЗ ДАННЫХ
 *.db
 *.sqlite
 *.sqlite3
-tech_control.db  # если у тебя так называется файл БД
+*.mdb
+*.accdb
 
-# 3. Виртуальное окружение Python
+# 3. ВИРТУАЛЬНОЕ ОКРУЖЕНИЕ PYTHON
 venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .python-version
 
-# 4. Файлы IDE (редакторов кода)
+# 4. ФАЙЛЫ РЕДАКТОРОВ КОДА
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-*
 
-# 5. Системные файлы
+# 5. СИСТЕМНЫЕ ФАЙЛЫ
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# 6. ЛОГИ И ВРЕМЕННЫЕ ФАЙЛЫ
+*.log
+*.tmp
+*.temp
+
+# 7. ФАЙЛЫ ПАКЕТОВ
+*.egg
+*.egg-info/
+dist/
+build/
+
+# 8. ФОТО И МЕДИА (если будут)
+uploads/
+photos/
+*.jpg
+*.png
+*.mp4
