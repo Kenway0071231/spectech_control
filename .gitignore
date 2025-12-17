@@ -1,4 +1,5 @@
-echo venv/ > .gitignore
-echo .env >> .gitignore
-echo *.db >> .gitignore
-echo __pycache__/ >> .gitignore
+venv/
+.env
+*.db
+__pycache__/
+*.pyc
