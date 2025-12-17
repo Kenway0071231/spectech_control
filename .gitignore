@@ -1,5 +1,27 @@
-venv/
+# 1. Файлы с паролями и ключами
 .env
+.env.local
+secrets.txt
+
+# 2. Файлы баз данных (готовые, с данными)
 *.db
+*.sqlite
+*.sqlite3
+tech_control.db  # если у тебя так называется файл БД
+
+# 3. Виртуальное окружение Python
+venv/
 __pycache__/
 *.pyc
+.python-version
+
+# 4. Файлы IDE (редакторов кода)
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 5. Системные файлы
+Thumbs.db
+.DS_Store
+desktop.ini
