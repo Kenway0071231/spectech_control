@@ -1,18 +1,26 @@
 import aiosqlite
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_path='tech_control.db'):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        # Для bothost.ru используем базу в памяти, для локального теста - файловую
+        # Проверяем, есть ли переменная окружения BOTHOST (автоматически установится на хостинге)
+        if os.getenv('BOTHOST') or os.getenv('ON_HOSTING'):
+            self.db_path = ':memory:'  # База в оперативной памяти
+            print("⚡ Используется база данных в памяти (хостинг)")
+        else:
+            self.db_path = db_path or 'tech_control.db'
+            print(f"💾 Используется файловая база: {self.db_path}")
 
     async def connect(self):
         """Подключаемся к базе данных"""
         self.connection = await aiosqlite.connect(self.db_path)
         await self.create_tables()
-        logger.info("База данных подключена")
+        logger.info("✅ База данных подключена")
 
     async def create_tables(self):
         """Создаем таблицы если их нет"""
@@ -67,7 +75,7 @@ class Database:
         ''')
         
         await self.connection.commit()
-        logger.info("Таблицы созданы/проверены")
+        logger.info("✅ Таблицы созданы/проверены")
 
     async def add_test_data(self):
         """Добавляем тестовые данные для демонстрации"""
@@ -89,7 +97,7 @@ class Database:
                 pass
         
         await self.connection.commit()
-        logger.info("Тестовые данные добавлены")
+        logger.info("✅ Тестовые данные добавлены")
 
     async def get_equipment_list(self):
         """Получаем список всей техники"""
