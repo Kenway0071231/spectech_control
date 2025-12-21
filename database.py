@@ -1,6 +1,7 @@
 import aiosqlite
 import logging
 import os
+import json
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 shift_id INTEGER NOT NULL,
                 check_type TEXT NOT NULL,
-                photos TEXT,
+                photos TEXT,  -- JSON массив с file_id фотографий
                 notes TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (shift_id) REFERENCES shifts (id)
@@ -157,6 +158,44 @@ class Database:
         rows = await cursor.fetchall()
         await cursor.close()
         return rows
+
+    async def add_inspection_with_photos(self, shift_id, photo_ids, notes=""):
+        """Добавляем осмотр с фотографиями"""
+        # Преобразуем список photo_ids в JSON строку
+        photos_json = json.dumps(photo_ids) if photo_ids else None
+        
+        cursor = await self.connection.execute(
+            'INSERT INTO inspections (shift_id, check_type, photos, notes) VALUES (?, ?, ?, ?)',
+            (shift_id, 'pre_shift', photos_json, notes)
+        )
+        await self.connection.commit()
+        inspection_id = cursor.lastrowid
+        logger.info(f"✅ Осмотр {inspection_id} добавлен с {len(photo_ids) if photo_ids else 0} фото")
+        return inspection_id
+
+    async def get_shift_inspections(self, shift_id):
+        """Получаем все осмотры для смены"""
+        cursor = await self.connection.execute(
+            'SELECT id, check_type, photos, notes, created_at FROM inspections WHERE shift_id = ? ORDER BY created_at',
+            (shift_id,)
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        
+        # Парсим JSON фото
+        inspections = []
+        for row in rows:
+            ins_id, check_type, photos_json, notes, created_at = row
+            photos = json.loads(photos_json) if photos_json else []
+            inspections.append({
+                'id': ins_id,
+                'check_type': check_type,
+                'photos': photos,
+                'notes': notes,
+                'created_at': created_at
+            })
+        
+        return inspections
 
     async def close(self):
         """Закрываем соединение с базой"""
