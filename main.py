@@ -638,7 +638,7 @@ async def on_startup():
     
     # Создаем тестового администратора (ЗАМЕНИ 123456789 на СВОЙ telegram ID)
     # Чтобы узнать свой ID: напиши боту /start, он покажет твой ID
-    YOUR_TELEGRAM_ID = 123456789  # <-- ЗАМЕНИ ЭТО ЧИСЛО НА СВОЙ ID
+    YOUR_TELEGRAM_ID = 1079922982  # <-- ЗАМЕНИ ЭТО ЧИСЛО НА СВОЙ ID
     await db.register_driver(YOUR_TELEGRAM_ID, "Администратор", "admin")
     
     logging.info("Бот и база данных готовы к работе")
@@ -662,3 +662,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
