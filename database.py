@@ -43,6 +43,7 @@ class Database:
                 telegram_id INTEGER UNIQUE NOT NULL,
                 full_name TEXT NOT NULL,
                 phone TEXT,
+                role TEXT DEFAULT 'driver',  -- driver или admin
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -106,14 +107,33 @@ class Database:
         await cursor.close()
         return rows
 
-    async def register_driver(self, telegram_id, full_name):
-        """Регистрируем водителя"""
+    async def register_driver(self, telegram_id, full_name, role='driver'):
+        """Регистрируем водителя или админа"""
         await self.connection.execute(
-            'INSERT OR REPLACE INTO drivers (telegram_id, full_name) VALUES (?, ?)',
-            (telegram_id, full_name)
+            'INSERT OR REPLACE INTO drivers (telegram_id, full_name, role) VALUES (?, ?, ?)',
+            (telegram_id, full_name, role)
         )
         await self.connection.commit()
         return telegram_id
+
+    async def get_user_role(self, telegram_id):
+        """Получаем роль пользователя"""
+        cursor = await self.connection.execute(
+            'SELECT role FROM drivers WHERE telegram_id = ?',
+            (telegram_id,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row[0] if row else 'driver'
+
+    async def get_all_admins(self):
+        """Получаем всех администраторов"""
+        cursor = await self.connection.execute(
+            'SELECT telegram_id, full_name FROM drivers WHERE role = "admin"'
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return rows
 
     async def start_shift(self, driver_id, equipment_id):
         """Начинаем новую смену"""
@@ -143,6 +163,44 @@ class Database:
         row = await cursor.fetchone()
         await cursor.close()
         return row
+
+    async def get_all_active_shifts(self):
+        """Получаем все активные смены (для админа)"""
+        cursor = await self.connection.execute('''
+            SELECT s.id, s.start_time, d.full_name, e.name, e.model
+            FROM shifts s
+            JOIN drivers d ON s.driver_id = d.telegram_id
+            JOIN equipment e ON s.equipment_id = e.id
+            WHERE s.status = "active"
+            ORDER BY s.start_time DESC
+        ''')
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return rows
+
+    async def get_all_drivers(self):
+        """Получаем всех водителей (для админа)"""
+        cursor = await self.connection.execute(
+            'SELECT telegram_id, full_name, role, created_at FROM drivers ORDER BY full_name'
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return rows
+
+    async def add_equipment(self, name, model, vin):
+        """Добавляем новую технику (для админа)"""
+        try:
+            cursor = await self.connection.execute(
+                'INSERT INTO equipment (name, model, vin) VALUES (?, ?, ?)',
+                (name, model, vin)
+            )
+            await self.connection.commit()
+            equipment_id = cursor.lastrowid
+            logger.info(f"✅ Техника добавлена: {name} ({model})")
+            return equipment_id
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления техники: {e}")
+            return None
 
     async def get_driver_shifts(self, driver_id, limit=10):
         """Получаем последние смены водителя"""
@@ -196,6 +254,34 @@ class Database:
             })
         
         return inspections
+
+    async def get_shift_details(self, shift_id):
+        """Получаем детали смены"""
+        cursor = await self.connection.execute('''
+            SELECT s.id, s.start_time, s.end_time, s.status,
+                   d.full_name, d.telegram_id,
+                   e.name, e.model, e.id as equipment_id
+            FROM shifts s
+            JOIN drivers d ON s.driver_id = d.telegram_id
+            JOIN equipment e ON s.equipment_id = e.id
+            WHERE s.id = ?
+        ''', (shift_id,))
+        row = await cursor.fetchone()
+        await cursor.close()
+        
+        if row:
+            return {
+                'id': row[0],
+                'start_time': row[1],
+                'end_time': row[2],
+                'status': row[3],
+                'driver_name': row[4],
+                'driver_id': row[5],
+                'equipment_name': row[6],
+                'equipment_model': row[7],
+                'equipment_id': row[8]
+            }
+        return None
 
     async def close(self):
         """Закрываем соединение с базой"""
