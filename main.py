@@ -438,7 +438,7 @@ async def on_startup():
         await db.add_test_data()
         
         # Добавляем тестового админа (замени ID на свой)
-        ADMIN_ID = 123456789  # <-- ЗАМЕНИ НА СВОЙ ID
+        ADMIN_ID = 1079922982  # <-- ЗАМЕНИ НА СВОЙ ID
         await db.register_driver(ADMIN_ID, "Администратор", "admin")
         
         logger.info("✅ Бот готов к работе!")
@@ -459,3 +459,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
