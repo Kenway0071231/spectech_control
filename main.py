@@ -6,6 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import ContentType
 from dotenv import load_dotenv
 
 # Импортируем нашу базу данных
@@ -19,9 +20,9 @@ class ShiftStates(StatesGroup):
     choosing_equipment = State()  # Выбор техники
     safety_instruction = State()  # Инструктаж по безопасности
     pre_inspection = State()      # Предсменный осмотр
+    waiting_for_photos = State()  # Ожидание фотографий
 
 # ========== ПРОСТАЯ ИНИЦИАЛИЗАЦИЯ БОТА ==========
-# Используем прокси сразу (самый надежный способ)
 session = AiohttpSession()
 bot = Bot(token=os.getenv('BOT_TOKEN'), session=session)
 storage = MemoryStorage()
@@ -46,6 +47,7 @@ async def cmd_start(message: types.Message):
         keyboard = [
             [types.KeyboardButton(text="⏹️ Завершить смену")],
             [types.KeyboardButton(text="📋 Мои смены")],
+            [types.KeyboardButton(text="📸 Осмотры с фото")],
             [types.KeyboardButton(text="ℹ️  Информация")]
         ]
     else:
@@ -163,7 +165,8 @@ async def process_safety_instruction(message: types.Message, state: FSMContext):
     
     # Переходим к предсменному осмотру
     keyboard = [
-        [types.KeyboardButton(text="✅ Осмотр завершен, начинаю смену")],
+        [types.KeyboardButton(text="📸 Добавить фото осмотра")],
+        [types.KeyboardButton(text="✅ Завершить осмотр без фото")],
         [types.KeyboardButton(text="🔄 Запросить чек-лист осмотра")],
         [types.KeyboardButton(text="❌ Отмена")]
     ]
@@ -176,15 +179,17 @@ async def process_safety_instruction(message: types.Message, state: FSMContext):
         "3. Осмотрите гидравлические шланги на предмет утечек\n"
         "4. Проверьте работу всех приборов\n"
         "5. Сделайте фото основных узлов\n\n"
-        "После осмотра нажмите кнопку ниже:",
+        "Вы можете добавить фото или завершить осмотр:",
         reply_markup=reply_markup
     )
     
+    # Инициализируем список фото в состоянии
+    await state.update_data(inspection_photos=[])
     await state.set_state(ShiftStates.pre_inspection)
 
 @dp.message(ShiftStates.pre_inspection)
 async def process_pre_inspection(message: types.Message, state: FSMContext):
-    """Завершаем предсменный осмотр и начинаем смену"""
+    """Обрабатываем действия в состоянии осмотра"""
     
     if message.text == "❌ Отмена":
         await state.clear()
@@ -213,8 +218,17 @@ async def process_pre_inspection(message: types.Message, state: FSMContext):
         )
         return
     
-    if message.text == "✅ Осмотр завершен, начинаю смену":
-        # Получаем данные из состояния
+    if message.text == "📸 Добавить фото осмотра":
+        await message.answer(
+            "Отправьте фотографию осмотра. "
+            "Вы можете отправить несколько фото подряд.\n\n"
+            "После отправки фото нажмите '✅ Завершить осмотр с фото'."
+        )
+        await state.set_state(ShiftStates.waiting_for_photos)
+        return
+    
+    if message.text == "✅ Завершить осмотр без фото":
+        # Завершаем осмотр без фото
         data = await state.get_data()
         selected_eq = data.get('selected_equipment')
         
@@ -231,6 +245,9 @@ async def process_pre_inspection(message: types.Message, state: FSMContext):
             equipment_id=eq_id
         )
         
+        # Создаем запись об осмотре без фото
+        await db.add_inspection_with_photos(shift_id, [], "Осмотр без фото")
+        
         # Очищаем состояние
         await state.clear()
         
@@ -238,6 +255,7 @@ async def process_pre_inspection(message: types.Message, state: FSMContext):
         keyboard = [
             [types.KeyboardButton(text="⏹️ Завершить смену")],
             [types.KeyboardButton(text="📋 Мои смены")],
+            [types.KeyboardButton(text="📸 Осмотры с фото")],
             [types.KeyboardButton(text="ℹ️  Информация")]
         ]
         reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -246,13 +264,110 @@ async def process_pre_inspection(message: types.Message, state: FSMContext):
             f"✅ СМЕНА НАЧАТА!\n\n"
             f"Техника: {name} ({model})\n"
             f"ID смены: {shift_id}\n"
-            f"Время начала: {message.date.strftime('%H:%M %d.%m.%Y')}\n\n"
+            f"Время начала: {message.date.strftime('%H:%M %d.%m.%Y')}\n"
+            f"Фото осмотра: не добавлено\n\n"
             f"Удачной работы! Будьте внимательны.",
             reply_markup=reply_markup
         )
         return
     
     await message.answer("Пожалуйста, используйте кнопки меню.")
+
+@dp.message(ShiftStates.waiting_for_photos, F.content_type == ContentType.PHOTO)
+async def process_inspection_photo(message: types.Message, state: FSMContext):
+    """Обрабатываем фото осмотра"""
+    
+    # Получаем file_id самой качественной версии фото
+    photo = message.photo[-1]
+    photo_id = photo.file_id
+    
+    # Получаем текущий список фото из состояния
+    data = await state.get_data()
+    photos = data.get('inspection_photos', [])
+    
+    # Добавляем новое фото
+    photos.append(photo_id)
+    await state.update_data(inspection_photos=photos)
+    
+    # Показываем превью фото
+    await message.answer_photo(
+        photo_id,
+        caption=f"✅ Фото #{len(photos)} сохранено!\n"
+                f"Вы можете отправить ещё фото или завершить осмотр."
+    )
+    
+    # Показываем клавиатуру для продолжения
+    keyboard = [
+        [types.KeyboardButton(text="📸 Добавить ещё фото")],
+        [types.KeyboardButton(text="✅ Завершить осмотр с фото")],
+        [types.KeyboardButton(text="❌ Отмена")]
+    ]
+    reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    
+    await message.answer(
+        f"Добавлено фото: {len(photos)} шт.\n"
+        f"Что дальше?",
+        reply_markup=reply_markup
+    )
+    
+    # Возвращаемся в состояние осмотра
+    await state.set_state(ShiftStates.pre_inspection)
+
+@dp.message(ShiftStates.waiting_for_photos)
+async def handle_non_photo_in_waiting_state(message: types.Message, state: FSMContext):
+    """Обрабатываем не-фото сообщения в состоянии ожидания фото"""
+    await message.answer("Пожалуйста, отправьте фотографию или используйте кнопки меню.")
+
+@dp.message(F.text == "✅ Завершить осмотр с фото")
+async def complete_inspection_with_photos(message: types.Message, state: FSMContext):
+    """Завершаем осмотр с добавленными фото"""
+    
+    # Получаем данные из состояния
+    data = await state.get_data()
+    selected_eq = data.get('selected_equipment')
+    photos = data.get('inspection_photos', [])
+    
+    if not selected_eq:
+        await message.answer("Ошибка: данные о технике не найдены.")
+        await state.clear()
+        return
+    
+    if not photos:
+        await message.answer("Вы не добавили фото. Используйте '✅ Завершить осмотр без фото'.")
+        return
+    
+    eq_id, name, model = selected_eq
+    
+    # Начинаем смену в базе данных
+    shift_id = await db.start_shift(
+        driver_id=message.from_user.id,
+        equipment_id=eq_id
+    )
+    
+    # Создаем запись об осмотре с фото
+    await db.add_inspection_with_photos(shift_id, photos, f"Осмотр {name} ({model})")
+    
+    # Очищаем состояние
+    await state.clear()
+    
+    # Возвращаем основное меню
+    keyboard = [
+        [types.KeyboardButton(text="⏹️ Завершить смену")],
+        [types.KeyboardButton(text="📋 Мои смены")],
+        [types.KeyboardButton(text="📸 Осмотры с фото")],
+        [types.KeyboardButton(text="ℹ️  Информация")]
+    ]
+    reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    
+    await message.answer(
+        f"✅ СМЕНА НАЧАТА!\n\n"
+        f"Техника: {name} ({model})\n"
+        f"ID смены: {shift_id}\n"
+        f"Время начала: {message.date.strftime('%H:%M %d.%m.%Y')}\n"
+        f"Фото осмотра: {len(photos)} шт.\n\n"
+        f"Удачной работы! Будьте внимательны.",
+        reply_markup=reply_markup
+    )
 
 @dp.message(F.text == "⏹️ Завершить смену")
 async def end_shift_process(message: types.Message):
@@ -328,18 +443,62 @@ async def show_my_shifts(message: types.Message):
     
     await message.answer(text)
 
+@dp.message(F.text == "📸 Осмотры с фото")
+async def show_inspections_with_photos(message: types.Message):
+    """Показываем осмотры с фотографиями"""
+    
+    # Получаем последнюю активную или завершенную смену
+    shifts = await db.get_driver_shifts(message.from_user.id, limit=3)
+    
+    if not shifts:
+        await message.answer("📭 У вас ещё не было смен с осмотрами.")
+        return
+    
+    text = "📸 ОСМОТРЫ С ФОТОГРАФИЯМИ:\n\n"
+    
+    for shift in shifts:
+        shift_id, start_time, end_time, status, eq_name, eq_model = shift
+        
+        # Получаем осмотры для этой смены
+        inspections = await db.get_shift_inspections(shift_id)
+        
+        if inspections:
+            for inspection in inspections:
+                photo_count = len(inspection['photos'])
+                text += f"🔍 {eq_name} ({eq_model})\n"
+                text += f"   ID смены: {shift_id}\n"
+                text += f"   Фото: {photo_count} шт.\n"
+                text += f"   Дата: {inspection['created_at'][:16]}\n"
+                
+                if photo_count > 0:
+                    # Отправляем первое фото как превью
+                    await message.answer_photo(
+                        inspection['photos'][0],
+                        caption=f"Осмотр {eq_name} ({eq_model})\n"
+                                f"Фото 1 из {photo_count}\n"
+                                f"ID смены: {shift_id}"
+                    )
+                
+                text += "\n"
+    
+    if text == "📸 ОСМОТРЫ С ФОТОГРАФИЯМИ:\n\n":
+        text += "Нет осмотров с фотографиями."
+    
+    await message.answer(text)
+
 @dp.message(F.text == "ℹ️  Информация")
 async def show_info(message: types.Message):
     await message.answer(
-        "🤖 ТЕХКОНТРОЛЬ MVP v1.1\n\n"
-        "Версия с завершением смены.\n\n"
+        "🤖 ТЕХКОНТРОЛЬ MVP v1.2\n\n"
+        "Версия с загрузкой фото при осмотре.\n\n"
         "Доступные функции:\n"
         "✅ Начало смены\n"
         "✅ Инструктаж по безопасности\n"
-        "✅ Предсменный осмотр\n"
+        "✅ Предсменный осмотр с фото\n"
         "✅ Завершение смены\n"
         "✅ История смен (5 последних)\n"
-        "🔄 Интеграция с AI\n"
+        "✅ Просмотр осмотров с фото\n"
+        "🔄 Интеграция с AI (анализ фото)\n"
         "🔄 Веб-админка\n\n"
         "По вопросам: свяжитесь с разработчиком."
     )
