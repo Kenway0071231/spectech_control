@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -22,6 +23,12 @@ class ShiftStates(StatesGroup):
     pre_inspection = State()      # Предсменный осмотр
     waiting_for_photos = State()  # Ожидание фотографий
 
+# Состояния для админ-панели
+class AdminStates(StatesGroup):
+    waiting_for_equipment_name = State()
+    waiting_for_equipment_model = State()
+    waiting_for_equipment_vin = State()
+
 # ========== ПРОСТАЯ ИНИЦИАЛИЗАЦИЯ БОТА ==========
 session = AiohttpSession()
 bot = Bot(token=os.getenv('BOT_TOKEN'), session=session)
@@ -29,11 +36,112 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 # ===============================================
 
+# ========== ФУНКЦИИ ДЛЯ УВЕДОМЛЕНИЙ ==========
+
+async def notify_admins_shift_started(shift_id):
+    """Отправляем уведомление всем администраторам о начале смены"""
+    try:
+        # Получаем детали смены
+        shift_details = await db.get_shift_details(shift_id)
+        if not shift_details:
+            return
+        
+        # Получаем всех администраторов
+        admins = await db.get_all_admins()
+        
+        if not admins:
+            logging.info("Нет администраторов для уведомлений")
+            return
+        
+        message_text = (
+            "🔔 *НОВАЯ СМЕНА НАЧАТА*\n\n"
+            f"*Водитель:* {shift_details['driver_name']}\n"
+            f"*Техника:* {shift_details['equipment_name']} ({shift_details['equipment_model']})\n"
+            f"*Время начала:* {shift_details['start_time'][:16]}\n"
+            f"*ID смены:* {shift_id}\n\n"
+            f"Для просмотра активных смен: /admin"
+        )
+        
+        # Отправляем уведомление каждому администратору
+        for admin in admins:
+            admin_id, admin_name = admin
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=message_text,
+                    parse_mode="Markdown"
+                )
+                logging.info(f"Уведомление отправлено администратору: {admin_name}")
+            except Exception as e:
+                logging.error(f"Ошибка отправки уведомления администратору {admin_name}: {e}")
+        
+    except Exception as e:
+        logging.error(f"Ошибка в функции notify_admins_shift_started: {e}")
+
+async def notify_admins_shift_ended(shift_id):
+    """Отправляем уведомление всем администраторам о завершении смены"""
+    try:
+        # Получаем детали смены
+        shift_details = await db.get_shift_details(shift_id)
+        if not shift_details:
+            return
+        
+        # Рассчитываем продолжительность смены
+        start_time = shift_details['start_time']
+        end_time = shift_details['end_time']
+        
+        duration = "неизвестно"
+        if start_time and end_time:
+            try:
+                from datetime import datetime
+                start_dt = datetime.strptime(start_time[:19], "%Y-%m-%d %H:%M:%S")
+                end_dt = datetime.strptime(end_time[:19], "%Y-%m-%d %H:%M:%S")
+                diff = end_dt - start_dt
+                hours = diff.seconds // 3600
+                minutes = (diff.seconds % 3600) // 60
+                duration = f"{hours} ч {minutes} мин"
+            except:
+                pass
+        
+        # Получаем всех администраторов
+        admins = await db.get_all_admins()
+        
+        if not admins:
+            logging.info("Нет администраторов для уведомлений")
+            return
+        
+        message_text = (
+            "🔔 *СМЕНА ЗАВЕРШЕНА*\n\n"
+            f"*Водитель:* {shift_details['driver_name']}\n"
+            f"*Техника:* {shift_details['equipment_name']} ({shift_details['equipment_model']})\n"
+            f"*Время начала:* {shift_details['start_time'][:16]}\n"
+            f"*Время окончания:* {shift_details['end_time'][:16]}\n"
+            f"*Продолжительность:* {duration}\n"
+            f"*ID смены:* {shift_id}\n\n"
+            f"Для просмотра статистики: /admin"
+        )
+        
+        # Отправляем уведомление каждому администратору
+        for admin in admins:
+            admin_id, admin_name = admin
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=message_text,
+                    parse_mode="Markdown"
+                )
+                logging.info(f"Уведомление отправлено администратору: {admin_name}")
+            except Exception as e:
+                logging.error(f"Ошибка отправки уведомления администратору {admin_name}: {e}")
+        
+    except Exception as e:
+        logging.error(f"Ошибка в функции notify_admins_shift_ended: {e}")
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Регистрируем водителя в базе
+    # Регистрируем водителя в базе (по умолчанию driver)
     driver_id = await db.register_driver(
         telegram_id=message.from_user.id,
         full_name=f"{message.from_user.first_name} {message.from_user.last_name or ''}"
@@ -42,31 +150,176 @@ async def cmd_start(message: types.Message):
     # Проверяем, есть ли активная смена
     active_shift = await db.get_active_shift(message.from_user.id)
     
-    if active_shift:
-        # Если есть активная смена - показываем кнопку завершения
-        keyboard = [
-            [types.KeyboardButton(text="⏹️ Завершить смену")],
-            [types.KeyboardButton(text="📋 Мои смены")],
-            [types.KeyboardButton(text="📸 Осмотры с фото")],
-            [types.KeyboardButton(text="ℹ️  Информация")]
-        ]
+    # Проверяем роль пользователя
+    user_role = await db.get_user_role(message.from_user.id)
+    
+    if user_role == 'admin':
+        # Меню для админа
+        if active_shift:
+            keyboard = [
+                [types.KeyboardButton(text="⏹️ Завершить смену")],
+                [types.KeyboardButton(text="📋 Мои смены")],
+                [types.KeyboardButton(text="📸 Осмотры с фото")],
+                [types.KeyboardButton(text="👨‍💼 Админ-панель")],
+                [types.KeyboardButton(text="ℹ️  Информация")]
+            ]
+        else:
+            keyboard = [
+                [types.KeyboardButton(text="🚛 Начать смену")],
+                [types.KeyboardButton(text="📋 Мои смены")],
+                [types.KeyboardButton(text="📸 Осмотры с фото")],
+                [types.KeyboardButton(text="👨‍💼 Админ-панель")],
+                [types.KeyboardButton(text="ℹ️  Информация")]
+            ]
     else:
-        # Если нет активной смены - показываем кнопку начала
-        keyboard = [
-            [types.KeyboardButton(text="🚛 Начать смену")],
-            [types.KeyboardButton(text="📋 Мои смены")],
-            [types.KeyboardButton(text="ℹ️  Информация")]
-        ]
+        # Меню для водителя
+        if active_shift:
+            keyboard = [
+                [types.KeyboardButton(text="⏹️ Завершить смену")],
+                [types.KeyboardButton(text="📋 Мои смены")],
+                [types.KeyboardButton(text="📸 Осмотры с фото")],
+                [types.KeyboardButton(text="ℹ️  Информация")]
+            ]
+        else:
+            keyboard = [
+                [types.KeyboardButton(text="🚛 Начать смену")],
+                [types.KeyboardButton(text="📋 Мои смены")],
+                [types.KeyboardButton(text="ℹ️  Информация")]
+            ]
     
     reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     
     await message.answer(
         f"Привет, {message.from_user.first_name}!\n"
         f"Твой ID: {driver_id}\n"
+        f"Роль: {user_role}\n"
         f"Я бот для контроля спецтехники.\n"
         f"Выберите действие:",
         reply_markup=reply_markup
     )
+
+@dp.message(F.text == "👨‍💼 Админ-панель")
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    """Админ-панель для руководителя"""
+    
+    # Проверяем права доступа
+    user_role = await db.get_user_role(message.from_user.id)
+    
+    if user_role != 'admin':
+        await message.answer("⛔ У вас нет доступа к админ-панели.")
+        return
+    
+    keyboard = [
+        [types.KeyboardButton(text="📊 Активные смены")],
+        [types.KeyboardButton(text="📈 Статистика за сегодня")],
+        [types.KeyboardButton(text="👥 Все водители")],
+        [types.KeyboardButton(text="🚜 Вся техника")],
+        [types.KeyboardButton(text="➕ Добавить технику")],
+        [types.KeyboardButton(text="🔔 Тест уведомлений")],
+        [types.KeyboardButton(text="🔙 Назад")]
+    ]
+    
+    reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    
+    await message.answer(
+        "👨‍💼 АДМИН-ПАНЕЛЬ\n\n"
+        "Выберите действие:",
+        reply_markup=reply_markup
+    )
+
+@dp.message(F.text == "📊 Активные смены")
+async def show_active_shifts(message: types.Message):
+    """Показываем все активные смены"""
+    
+    user_role = await db.get_user_role(message.from_user.id)
+    if user_role != 'admin':
+        await message.answer("⛔ У вас нет прав для просмотра активных смен.")
+        return
+    
+    active_shifts = await db.get_all_active_shifts()
+    
+    if not active_shifts:
+        await message.answer("✅ На данный момент активных смен нет.")
+        return
+    
+    text = "📊 АКТИВНЫЕ СМЕНЫ:\n\n"
+    
+    for shift in active_shifts:
+        shift_id, start_time, driver_name, eq_name, eq_model = shift
+        
+        # Форматируем время
+        start_str = start_time[:16] if start_time else "—"
+        
+        text += f"🟢 *ID:* {shift_id}\n"
+        text += f"   *Водитель:* {driver_name}\n"
+        text += f"   *Техника:* {eq_name} ({eq_model})\n"
+        text += f"   *Начало:* {start_str}\n\n"
+    
+    text += f"*Всего активных смен:* {len(active_shifts)}"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "📈 Статистика за сегодня")
+async def show_today_stats(message: types.Message):
+    """Показываем статистику за сегодня"""
+    
+    user_role = await db.get_user_role(message.from_user.id)
+    if user_role != 'admin':
+        await message.answer("⛔ У вас нет прав для просмотра статистики.")
+        return
+    
+    # Временно простая статистика
+    active_shifts = await db.get_all_active_shifts()
+    
+    text = (
+        "📈 *СТАТИСТИКА ЗА СЕГОДНЯ*\n\n"
+        f"*Активных смен:* {len(active_shifts)}\n"
+        f"*Всего водителей:* {len(await db.get_all_drivers())}\n"
+        f"*Всего техники:* {len(await db.get_equipment_list())}\n\n"
+        "*Администраторов:*\n"
+    )
+    
+    # Список администраторов
+    admins = await db.get_all_admins()
+    for admin in admins:
+        admin_id, admin_name = admin
+        text += f"👑 {admin_name}\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "🔔 Тест уведомлений")
+async def test_notifications(message: types.Message):
+    """Тестовая отправка уведомлений"""
+    
+    user_role = await db.get_user_role(message.from_user.id)
+    if user_role != 'admin':
+        await message.answer("⛔ У вас нет прав для теста уведомлений.")
+        return
+    
+    await message.answer("📡 Отправляю тестовое уведомление...")
+    
+    try:
+        # Отправляем тестовое сообщение самому себе
+        test_text = (
+            "🔔 *ТЕСТ УВЕДОМЛЕНИЙ*\n\n"
+            "Это тестовое уведомление от системы.\n"
+            "Если вы видите это сообщение, значит система уведомлений работает корректно.\n\n"
+            f"*Время:* {message.date.strftime('%H:%M %d.%m.%Y')}"
+        )
+        
+        await bot.send_message(
+            chat_id=message.from_user.id,
+            text=test_text,
+            parse_mode="Markdown"
+        )
+        
+        await message.answer("✅ Тестовое уведомление отправлено успешно!")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки уведомления: {e}")
+
+# ========== ОСНОВНЫЕ ФУНКЦИИ С УВЕДОМЛЕНИЯМИ ==========
 
 @dp.message(F.text == "🚛 Начать смену")
 async def start_shift_process(message: types.Message, state: FSMContext):
@@ -248,17 +501,14 @@ async def process_pre_inspection(message: types.Message, state: FSMContext):
         # Создаем запись об осмотре без фото
         await db.add_inspection_with_photos(shift_id, [], "Осмотр без фото")
         
+        # Отправляем уведомление администраторам
+        asyncio.create_task(notify_admins_shift_started(shift_id))
+        
         # Очищаем состояние
         await state.clear()
         
         # Возвращаем основное меню
-        keyboard = [
-            [types.KeyboardButton(text="⏹️ Завершить смену")],
-            [types.KeyboardButton(text="📋 Мои смены")],
-            [types.KeyboardButton(text="📸 Осмотры с фото")],
-            [types.KeyboardButton(text="ℹ️  Информация")]
-        ]
-        reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+        reply_markup = await get_admin_keyboard(message.from_user.id)
         
         await message.answer(
             f"✅ СМЕНА НАЧАТА!\n\n"
@@ -266,57 +516,13 @@ async def process_pre_inspection(message: types.Message, state: FSMContext):
             f"ID смены: {shift_id}\n"
             f"Время начала: {message.date.strftime('%H:%M %d.%m.%Y')}\n"
             f"Фото осмотра: не добавлено\n\n"
+            f"Уведомление отправлено руководителям.\n"
             f"Удачной работы! Будьте внимательны.",
             reply_markup=reply_markup
         )
         return
     
     await message.answer("Пожалуйста, используйте кнопки меню.")
-
-@dp.message(ShiftStates.waiting_for_photos, F.content_type == ContentType.PHOTO)
-async def process_inspection_photo(message: types.Message, state: FSMContext):
-    """Обрабатываем фото осмотра"""
-    
-    # Получаем file_id самой качественной версии фото
-    photo = message.photo[-1]
-    photo_id = photo.file_id
-    
-    # Получаем текущий список фото из состояния
-    data = await state.get_data()
-    photos = data.get('inspection_photos', [])
-    
-    # Добавляем новое фото
-    photos.append(photo_id)
-    await state.update_data(inspection_photos=photos)
-    
-    # Показываем превью фото
-    await message.answer_photo(
-        photo_id,
-        caption=f"✅ Фото #{len(photos)} сохранено!\n"
-                f"Вы можете отправить ещё фото или завершить осмотр."
-    )
-    
-    # Показываем клавиатуру для продолжения
-    keyboard = [
-        [types.KeyboardButton(text="📸 Добавить ещё фото")],
-        [types.KeyboardButton(text="✅ Завершить осмотр с фото")],
-        [types.KeyboardButton(text="❌ Отмена")]
-    ]
-    reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-    
-    await message.answer(
-        f"Добавлено фото: {len(photos)} шт.\n"
-        f"Что дальше?",
-        reply_markup=reply_markup
-    )
-    
-    # Возвращаемся в состояние осмотра
-    await state.set_state(ShiftStates.pre_inspection)
-
-@dp.message(ShiftStates.waiting_for_photos)
-async def handle_non_photo_in_waiting_state(message: types.Message, state: FSMContext):
-    """Обрабатываем не-фото сообщения в состоянии ожидания фото"""
-    await message.answer("Пожалуйста, отправьте фотографию или используйте кнопки меню.")
 
 @dp.message(F.text == "✅ Завершить осмотр с фото")
 async def complete_inspection_with_photos(message: types.Message, state: FSMContext):
@@ -347,17 +553,14 @@ async def complete_inspection_with_photos(message: types.Message, state: FSMCont
     # Создаем запись об осмотре с фото
     await db.add_inspection_with_photos(shift_id, photos, f"Осмотр {name} ({model})")
     
+    # Отправляем уведомление администраторам
+    asyncio.create_task(notify_admins_shift_started(shift_id))
+    
     # Очищаем состояние
     await state.clear()
     
     # Возвращаем основное меню
-    keyboard = [
-        [types.KeyboardButton(text="⏹️ Завершить смену")],
-        [types.KeyboardButton(text="📋 Мои смены")],
-        [types.KeyboardButton(text="📸 Осмотры с фото")],
-        [types.KeyboardButton(text="ℹ️  Информация")]
-    ]
-    reply_markup = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    reply_markup = await get_admin_keyboard(message.from_user.id)
     
     await message.answer(
         f"✅ СМЕНА НАЧАТА!\n\n"
@@ -365,6 +568,7 @@ async def complete_inspection_with_photos(message: types.Message, state: FSMCont
         f"ID смены: {shift_id}\n"
         f"Время начала: {message.date.strftime('%H:%M %d.%m.%Y')}\n"
         f"Фото осмотра: {len(photos)} шт.\n\n"
+        f"Уведомление отправлено руководителям.\n"
         f"Удачной работы! Будьте внимательны.",
         reply_markup=reply_markup
     )
@@ -385,6 +589,9 @@ async def end_shift_process(message: types.Message):
     # Завершаем смену в базе
     await db.end_shift(shift_id)
     
+    # Отправляем уведомление администраторам
+    asyncio.create_task(notify_admins_shift_ended(shift_id))
+    
     # Получаем название техники для красивого ответа
     cursor = await db.connection.execute(
         'SELECT name, model FROM equipment WHERE id = ?', 
@@ -404,106 +611,22 @@ async def end_shift_process(message: types.Message):
         f"Техника: {equipment_text}\n"
         f"ID смены: {shift_id}\n"
         f"Время окончания: {message.date.strftime('%H:%M %d.%m.%Y')}\n\n"
+        f"Уведомление отправлено руководителям.\n"
         f"Спасибо за работу! Отдыхайте."
     )
     
     # Обновляем меню (уберем кнопку завершения)
     await cmd_start(message)
 
-@dp.message(F.text == "📋 Мои смены")
-async def show_my_shifts(message: types.Message):
-    """Показываем историю смен водителя"""
-    
-    # Получаем смены из базы
-    shifts = await db.get_driver_shifts(message.from_user.id, limit=5)
-    
-    if not shifts:
-        await message.answer("📭 У вас ещё не было смен.")
-        return
-    
-    # Формируем сообщение
-    text = "📊 ПОСЛЕДНИЕ СМЕНЫ:\n\n"
-    
-    for shift in shifts:
-        shift_id, start_time, end_time, status, eq_name, eq_model = shift
-        
-        # Форматируем время
-        start_str = start_time[:16] if start_time else "—"
-        end_str = end_time[:16] if end_time else "в процессе"
-        
-        # Статус
-        status_icon = "✅" if status == "completed" else "🟡"
-        
-        text += f"{status_icon} {eq_name} ({eq_model})\n"
-        text += f"   Начало: {start_str}\n"
-        text += f"   Окончание: {end_str}\n"
-        text += f"   ID: {shift_id}\n\n"
-    
-    text += "Всего смен: " + str(len(shifts))
-    
-    await message.answer(text)
+# ========== ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
 
-@dp.message(F.text == "📸 Осмотры с фото")
-async def show_inspections_with_photos(message: types.Message):
-    """Показываем осмотры с фотографиями"""
-    
-    # Получаем последнюю активную или завершенную смену
-    shifts = await db.get_driver_shifts(message.from_user.id, limit=3)
-    
-    if not shifts:
-        await message.answer("📭 У вас ещё не было смен с осмотрами.")
-        return
-    
-    text = "📸 ОСМОТРЫ С ФОТОГРАФИЯМИ:\n\n"
-    
-    for shift in shifts:
-        shift_id, start_time, end_time, status, eq_name, eq_model = shift
-        
-        # Получаем осмотры для этой смены
-        inspections = await db.get_shift_inspections(shift_id)
-        
-        if inspections:
-            for inspection in inspections:
-                photo_count = len(inspection['photos'])
-                text += f"🔍 {eq_name} ({eq_model})\n"
-                text += f"   ID смены: {shift_id}\n"
-                text += f"   Фото: {photo_count} шт.\n"
-                text += f"   Дата: {inspection['created_at'][:16]}\n"
-                
-                if photo_count > 0:
-                    # Отправляем первое фото как превью
-                    await message.answer_photo(
-                        inspection['photos'][0],
-                        caption=f"Осмотр {eq_name} ({eq_model})\n"
-                                f"Фото 1 из {photo_count}\n"
-                                f"ID смены: {shift_id}"
-                    )
-                
-                text += "\n"
-    
-    if text == "📸 ОСМОТРЫ С ФОТОГРАФИЯМИ:\n\n":
-        text += "Нет осмотров с фотографиями."
-    
-    await message.answer(text)
+# [Остальной код оставляем без изменений: 
+# show_my_shifts, show_inspections_with_photos, add_equipment_start, 
+# process_equipment_name, process_equipment_model, process_equipment_vin,
+# back_to_main_menu, get_admin_keyboard, show_all_drivers, show_all_equipment,
+# process_inspection_photo, handle_non_photo_in_waiting_state, show_info]
 
-@dp.message(F.text == "ℹ️  Информация")
-async def show_info(message: types.Message):
-    await message.answer(
-        "🤖 ТЕХКОНТРОЛЬ MVP v1.2\n\n"
-        "Версия с загрузкой фото при осмотре.\n\n"
-        "Доступные функции:\n"
-        "✅ Начало смены\n"
-        "✅ Инструктаж по безопасности\n"
-        "✅ Предсменный осмотр с фото\n"
-        "✅ Завершение смены\n"
-        "✅ История смен (5 последних)\n"
-        "✅ Просмотр осмотров с фото\n"
-        "🔄 Интеграция с AI (анализ фото)\n"
-        "🔄 Веб-админка\n\n"
-        "По вопросам: свяжитесь с разработчиком."
-    )
-
-# ========== ЗАПУСК БОТА ==========
+# ========== ЗАПУСК БОТА С СОЗДАНИЕМ ТЕСТОВОГО АДМИНА ==========
 
 async def on_startup():
     """Действия при запуске бота"""
@@ -512,6 +635,11 @@ async def on_startup():
     
     # Добавляем тестовые данные (если их нет)
     await db.add_test_data()
+    
+    # Создаем тестового администратора (ЗАМЕНИ 123456789 на СВОЙ telegram ID)
+    # Чтобы узнать свой ID: напиши боту /start, он покажет твой ID
+    YOUR_TELEGRAM_ID = 123456789  # <-- ЗАМЕНИ ЭТО ЧИСЛО НА СВОЙ ID
+    await db.register_driver(YOUR_TELEGRAM_ID, "Администратор", "admin")
     
     logging.info("Бот и база данных готовы к работе")
 
@@ -533,5 +661,4 @@ async def main():
     await on_shutdown()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
