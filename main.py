@@ -1045,7 +1045,7 @@ async def on_startup():
         await db.add_test_data()
         
         # Создаем администратора (ЗАМЕНИТЕ ID)
-        ADMIN_ID = 123456789  # <-- ВАШ TELEGRAM ID
+        ADMIN_ID = 1079922982  # <-- ВАШ TELEGRAM ID
         await db.register_user(
             ADMIN_ID,
             "Администратор Бота",
@@ -1072,3 +1072,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
