@@ -3,7 +3,7 @@ import logging
 import os
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Настройка логирования
 logging.basicConfig(
@@ -12,26 +12,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Константы ролей (иерархия сверху вниз)
+# Константы ролей
 ROLES = {
-    'botadmin': {'name': 'Администратор бота', 'level': 100, 'can_manage': ['director', 'fleetmanager', 'driver']},
-    'director': {'name': 'Директор компании', 'level': 80, 'can_manage': ['fleetmanager', 'driver']},
-    'fleetmanager': {'name': 'Начальник парка', 'level': 60, 'can_manage': ['driver']},
-    'driver': {'name': 'Водитель', 'level': 40, 'can_manage': []}
+    'botadmin': {'name': 'Администратор бота', 'level': 100},
+    'director': {'name': 'Директор компании', 'level': 80},
+    'fleetmanager': {'name': 'Начальник парка', 'level': 60},
+    'driver': {'name': 'Водитель', 'level': 40}
 }
 
 class Database:
     def __init__(self, db_path=None):
-        # Кэш для быстрого доступа
-        self._equipment_cache = None
-        self._users_cache = {}
+        self.db_path = db_path or ':memory:' if os.getenv('BOTHOST') else 'tech_control.db'
         
-        # Для хостинга используем базу в памяти
-        if os.getenv('BOTHOST') or os.getenv('ON_HOSTING'):
-            self.db_path = ':memory:'
-        else:
-            self.db_path = db_path or 'tech_control.db'
-        
+        # Кэши
+        self._org_cache = {}
+        self._equipment_cache = {}
         print(f"📦 База данных: {self.db_path}")
 
     async def connect(self):
@@ -50,22 +45,19 @@ class Database:
         tables = [
             '''CREATE TABLE IF NOT EXISTS organizations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
                 director_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (director_id) REFERENCES drivers(telegram_id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )''',
-            '''CREATE TABLE IF NOT EXISTS drivers (
+            '''CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER UNIQUE NOT NULL,
                 full_name TEXT NOT NULL,
-                phone TEXT,
+                username TEXT,
                 role TEXT DEFAULT 'driver',
                 organization_id INTEGER,
-                assigned_by INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (organization_id) REFERENCES organizations(id),
-                FOREIGN KEY (assigned_by) REFERENCES drivers(telegram_id)
+                FOREIGN KEY (organization_id) REFERENCES organizations(id)
             )''',
             '''CREATE TABLE IF NOT EXISTS equipment (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +69,7 @@ class Database:
                 created_by INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (organization_id) REFERENCES organizations(id),
-                FOREIGN KEY (created_by) REFERENCES drivers(telegram_id)
+                FOREIGN KEY (created_by) REFERENCES users(telegram_id)
             )''',
             '''CREATE TABLE IF NOT EXISTS shifts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,10 +78,8 @@ class Database:
                 start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 end_time TIMESTAMP,
                 status TEXT DEFAULT 'active',
-                organization_id INTEGER NOT NULL,
-                FOREIGN KEY (driver_id) REFERENCES drivers(telegram_id),
-                FOREIGN KEY (equipment_id) REFERENCES equipment(id),
-                FOREIGN KEY (organization_id) REFERENCES organizations(id)
+                FOREIGN KEY (driver_id) REFERENCES users(telegram_id),
+                FOREIGN KEY (equipment_id) REFERENCES equipment(id)
             )''',
             '''CREATE TABLE IF NOT EXISTS inspections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,262 +93,186 @@ class Database:
         ]
         
         for table_sql in tables:
-            try:
-                await self.connection.execute(table_sql)
-            except Exception as e:
-                logger.error(f"❌ Ошибка создания таблицы: {e}")
-        
+            await self.connection.execute(table_sql)
         await self.connection.commit()
 
     async def add_test_data(self):
         """Добавляем тестовые данные"""
-        # Тестовая организация
         try:
+            # Тестовая организация
             await self.connection.execute(
                 'INSERT OR IGNORE INTO organizations (name, director_id) VALUES (?, ?)',
-                ('Тестовая компания ООО "СпецТех"', 123456789)  # ID администратора
+                ('ООО "СпецТех Контроль"', 123456789)
             )
-            await self.connection.commit()
-        except:
-            pass
-
-        # Тестовая техника
-        equipment = [
-            ('Экскаватор CAT 320', 'CAT 320', 'CAT123456789', 1),
-            ('Бульдозер Komatsu D65', 'Komatsu D65', 'KOM987654321', 1),
-            ('Автокран Liebherr LTM 1100', 'Liebherr LTM 1100', 'LIE555666777', 1)
-        ]
-        
-        for eq in equipment:
-            try:
+            
+            # Тестовая техника
+            equipment = [
+                ('Экскаватор CAT 320', 'CAT 320', 'CAT123456789', 1),
+                ('Бульдозер Komatsu D65', 'Komatsu D65', 'KOM987654321', 1),
+                ('Автокран Liebherr LTM 1100', 'Liebherr LTM 1100', 'LIE555666777', 1)
+            ]
+            
+            for eq in equipment:
                 await self.connection.execute(
                     'INSERT OR IGNORE INTO equipment (name, model, vin, organization_id, created_by) VALUES (?, ?, ?, ?, ?)',
                     (*eq, 123456789)
                 )
-            except Exception:
-                pass
-        
-        await self.connection.commit()
-        logger.info("✅ Тестовые данные добавлены")
+            
+            await self.connection.commit()
+            logger.info("✅ Тестовые данные добавлены")
+        except Exception as e:
+            logger.error(f"Ошибка добавления тестовых данных: {e}")
 
-    # ========== МЕТОДЫ ДЛЯ РОЛЕЙ ==========
+    # ========== ОСНОВНЫЕ МЕТОДЫ ==========
 
-    async def register_user(self, telegram_id: int, full_name: str, role: str = 'driver', 
-                          organization_id: int = None, assigned_by: int = None) -> int:
-        """Регистрируем пользователя с ролью"""
-        await self.connection.execute(
-            '''INSERT OR REPLACE INTO drivers 
-               (telegram_id, full_name, role, organization_id, assigned_by) 
-               VALUES (?, ?, ?, ?, ?)''',
-            (telegram_id, full_name, role, organization_id, assigned_by)
-        )
-        await self.connection.commit()
-        
-        # Очищаем кэш
-        if telegram_id in self._users_cache:
-            del self._users_cache[telegram_id]
-        
-        logger.info(f"✅ Пользователь {telegram_id} зарегистрирован как {role}")
-        return telegram_id
+    async def register_user(self, telegram_id: int, full_name: str, username: str = None, 
+                          role: str = 'driver', organization_id: int = None) -> bool:
+        """Регистрирует или обновляет пользователя"""
+        try:
+            await self.connection.execute(
+                '''INSERT OR REPLACE INTO users 
+                   (telegram_id, full_name, username, role, organization_id) 
+                   VALUES (?, ?, ?, ?, ?)''',
+                (telegram_id, full_name, username, role, organization_id)
+            )
+            await self.connection.commit()
+            
+            # Очищаем кэш
+            if 'users' in self._org_cache:
+                del self._org_cache['users']
+                
+            logger.info(f"✅ Пользователь {telegram_id} зарегистрирован как {role}")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка регистрации пользователя: {e}")
+            return False
 
-    async def get_user_role(self, telegram_id: int) -> str:
-        """Получаем роль пользователя"""
-        if telegram_id in self._users_cache:
-            return self._users_cache[telegram_id].get('role', 'driver')
-        
+    async def get_user(self, telegram_id: int) -> Optional[Dict]:
+        """Получает информацию о пользователе"""
         cursor = await self.connection.execute(
-            'SELECT role FROM drivers WHERE telegram_id = ?',
+            'SELECT * FROM users WHERE telegram_id = ?',
             (telegram_id,)
         )
         row = await cursor.fetchone()
         await cursor.close()
-        
-        role = row['role'] if row else 'driver'
-        
-        # Сохраняем в кэш
-        if telegram_id not in self._users_cache:
-            self._users_cache[telegram_id] = {}
-        self._users_cache[telegram_id]['role'] = role
-        
-        return role
+        return dict(row) if row else None
 
-    async def get_user_info(self, telegram_id: int) -> Dict:
-        """Получаем полную информацию о пользователе"""
-        cursor = await self.connection.execute('''
-            SELECT d.*, o.name as organization_name 
-            FROM drivers d 
-            LEFT JOIN organizations o ON d.organization_id = o.id 
-            WHERE d.telegram_id = ?
-        ''', (telegram_id,))
-        row = await cursor.fetchone()
-        await cursor.close()
-        
-        if row:
-            info = dict(row)
-            info['role_name'] = ROLES.get(info['role'], {}).get('name', 'Неизвестно')
-            return info
-        return None
+    async def get_user_role(self, telegram_id: int) -> str:
+        """Получает роль пользователя"""
+        user = await self.get_user(telegram_id)
+        return user['role'] if user else 'driver'
 
-    async def can_manage_role(self, manager_role: str, target_role: str) -> bool:
-        """Проверяет, может ли менеджер управлять целевой ролью"""
-        if manager_role not in ROLES:
-            return False
-        return target_role in ROLES[manager_role]['can_manage']
-
-    async def change_user_role(self, telegram_id: int, new_role: str, 
-                             changed_by: int, organization_id: int = None) -> bool:
-        """Изменяет роль пользователя"""
-        # Получаем текущую роль
-        current_role = await self.get_user_role(telegram_id)
-        
-        # Получаем роль того, кто меняет
-        changer_role = await self.get_user_role(changed_by)
-        
-        # Проверяем права
-        if not await self.can_manage_role(changer_role, new_role):
-            logger.warning(f"❌ {changer_role} не может назначить роль {new_role}")
-            return False
-        
-        # Меняем роль
-        await self.connection.execute(
-            'UPDATE drivers SET role = ?, organization_id = ?, assigned_by = ? WHERE telegram_id = ?',
-            (new_role, organization_id, changed_by, telegram_id)
-        )
-        await self.connection.commit()
-        
-        # Очищаем кэш
-        if telegram_id in self._users_cache:
-            del self._users_cache[telegram_id]
-        
-        logger.info(f"✅ Роль пользователя {telegram_id} изменена с {current_role} на {new_role}")
-        return True
-
-    async def get_users_by_role(self, role: str, organization_id: int = None) -> List[Dict]:
-        """Получает всех пользователей с указанной ролью"""
-        query = 'SELECT * FROM drivers WHERE role = ?'
-        params = [role]
-        
-        if organization_id:
-            query += ' AND organization_id = ?'
-            params.append(organization_id)
-        
-        cursor = await self.connection.execute(query, params)
-        rows = await cursor.fetchall()
-        await cursor.close()
-        
-        return [dict(row) for row in rows]
-
-    async def get_users_in_organization(self, organization_id: int) -> List[Dict]:
-        """Получает всех пользователей в организации"""
-        cursor = await self.connection.execute(
-            'SELECT * FROM drivers WHERE organization_id = ? ORDER BY role DESC',
-            (organization_id,)
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        
-        return [dict(row) for row in rows]
-
-    # ========== МЕТОДЫ ДЛЯ ОРГАНИЗАЦИЙ ==========
+    async def get_user_organization(self, telegram_id: int) -> Optional[int]:
+        """Получает организацию пользователя"""
+        user = await self.get_user(telegram_id)
+        return user['organization_id'] if user else None
 
     async def create_organization(self, name: str, director_id: int) -> int:
         """Создает новую организацию"""
-        cursor = await self.connection.execute(
-            'INSERT INTO organizations (name, director_id) VALUES (?, ?)',
-            (name, director_id)
-        )
-        await self.connection.commit()
-        
-        org_id = cursor.lastrowid
-        
-        # Обновляем организацию у директора
-        await self.connection.execute(
-            'UPDATE drivers SET organization_id = ? WHERE telegram_id = ?',
-            (org_id, director_id)
-        )
-        await self.connection.commit()
-        
-        logger.info(f"✅ Создана организация {name} (ID: {org_id})")
-        return org_id
+        try:
+            cursor = await self.connection.execute(
+                'INSERT INTO organizations (name, director_id) VALUES (?, ?)',
+                (name, director_id)
+            )
+            org_id = cursor.lastrowid
+            
+            # Обновляем организацию у директора
+            await self.connection.execute(
+                'UPDATE users SET organization_id = ? WHERE telegram_id = ?',
+                (org_id, director_id)
+            )
+            await self.connection.commit()
+            
+            logger.info(f"✅ Организация создана: {name} (ID: {org_id})")
+            return org_id
+        except Exception as e:
+            logger.error(f"Ошибка создания организации: {e}")
+            return 0
 
-    async def get_organization_info(self, organization_id: int) -> Dict:
+    async def get_organization(self, org_id: int) -> Optional[Dict]:
         """Получает информацию об организации"""
         cursor = await self.connection.execute(
             'SELECT * FROM organizations WHERE id = ?',
-            (organization_id,)
+            (org_id,)
         )
         row = await cursor.fetchone()
         await cursor.close()
-        
         return dict(row) if row else None
 
-    async def get_user_organization(self, telegram_id: int) -> Optional[int]:
-        """Получает ID организации пользователя"""
+    async def get_organization_users(self, org_id: int) -> List[Dict]:
+        """Получает всех пользователей организации"""
         cursor = await self.connection.execute(
-            'SELECT organization_id FROM drivers WHERE telegram_id = ?',
-            (telegram_id,)
+            'SELECT * FROM users WHERE organization_id = ? ORDER BY role DESC',
+            (org_id,)
         )
-        row = await cursor.fetchone()
+        rows = await cursor.fetchall()
         await cursor.close()
-        
-        return row['organization_id'] if row else None
+        return [dict(row) for row in rows]
 
-    # ========== МЕТОДЫ ДЛЯ ТЕХНИКИ ==========
+    async def update_user_role(self, telegram_id: int, new_role: str, 
+                             organization_id: int = None) -> bool:
+        """Изменяет роль пользователя"""
+        try:
+            if organization_id:
+                await self.connection.execute(
+                    'UPDATE users SET role = ?, organization_id = ? WHERE telegram_id = ?',
+                    (new_role, organization_id, telegram_id)
+                )
+            else:
+                await self.connection.execute(
+                    'UPDATE users SET role = ? WHERE telegram_id = ?',
+                    (new_role, telegram_id)
+                )
+            
+            await self.connection.commit()
+            logger.info(f"✅ Роль пользователя {telegram_id} изменена на {new_role}")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка изменения роли: {e}")
+            return False
 
     async def add_equipment(self, name: str, model: str, vin: str, 
                           organization_id: int, created_by: int) -> int:
-        """Добавляет технику в организацию"""
-        cursor = await self.connection.execute(
-            '''INSERT INTO equipment (name, model, vin, organization_id, created_by) 
-               VALUES (?, ?, ?, ?, ?)''',
-            (name, model, vin, organization_id, created_by)
-        )
-        await self.connection.commit()
-        
-        # Очищаем кэш техники
-        self._equipment_cache = None
-        
-        logger.info(f"✅ Добавлена техника: {name} ({model})")
-        return cursor.lastrowid
+        """Добавляет технику"""
+        try:
+            cursor = await self.connection.execute(
+                '''INSERT INTO equipment (name, model, vin, organization_id, created_by) 
+                   VALUES (?, ?, ?, ?, ?)''',
+                (name, model, vin, organization_id, created_by)
+            )
+            await self.connection.commit()
+            
+            # Очищаем кэш техники
+            if organization_id in self._equipment_cache:
+                del self._equipment_cache[organization_id]
+                
+            logger.info(f"✅ Техника добавлена: {name}")
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка добавления техники: {e}")
+            return 0
 
-    async def get_equipment_list(self, organization_id: int = None) -> List[Tuple]:
-        """Получает список техники (все или по организации)"""
-        if organization_id:
-            cursor = await self.connection.execute(
-                'SELECT id, name, model, status FROM equipment WHERE organization_id = ? ORDER BY name',
-                (organization_id,)
-            )
-        else:
-            cursor = await self.connection.execute(
-                'SELECT id, name, model, status FROM equipment ORDER BY name'
-            )
-        
+    async def get_organization_equipment(self, org_id: int) -> List[Dict]:
+        """Получает технику организации"""
+        if org_id in self._equipment_cache:
+            return self._equipment_cache[org_id]
+            
+        cursor = await self.connection.execute(
+            'SELECT id, name, model, status FROM equipment WHERE organization_id = ? ORDER BY name',
+            (org_id,)
+        )
         rows = await cursor.fetchall()
         await cursor.close()
         
-        return [(row['id'], row['name'], row['model'], row['status']) for row in rows]
+        equipment = [dict(row) for row in rows]
+        self._equipment_cache[org_id] = equipment
+        return equipment
 
-    async def update_equipment_status(self, equipment_id: int, status: str) -> bool:
-        """Обновляет статус техники"""
-        await self.connection.execute(
-            'UPDATE equipment SET status = ? WHERE id = ?',
-            (status, equipment_id)
-        )
-        await self.connection.commit()
-        
-        # Очищаем кэш
-        self._equipment_cache = None
-        
-        return True
-
-    # ========== МЕТОДЫ ДЛЯ СМЕН ==========
-
-    async def start_shift(self, driver_id: int, equipment_id: int, organization_id: int) -> int:
-        """Начинает новую смену"""
+    async def start_shift(self, driver_id: int, equipment_id: int) -> int:
+        """Начинает смену"""
         cursor = await self.connection.execute(
-            '''INSERT INTO shifts (driver_id, equipment_id, organization_id) 
-               VALUES (?, ?, ?)''',
-            (driver_id, equipment_id, organization_id)
+            'INSERT INTO shifts (driver_id, equipment_id) VALUES (?, ?)',
+            (driver_id, equipment_id)
         )
         await self.connection.commit()
         return cursor.lastrowid
@@ -372,42 +286,23 @@ class Database:
         await self.connection.commit()
         return True
 
-    async def get_active_shift(self, driver_id: int):
-        """Получает активную смену водителя"""
+    async def get_active_shift(self, driver_id: int) -> Optional[Dict]:
+        """Получает активную смену"""
         cursor = await self.connection.execute(
             '''SELECT s.id, s.equipment_id, e.name, e.model 
                FROM shifts s 
                JOIN equipment e ON s.equipment_id = e.id 
                WHERE s.driver_id = ? AND s.status = "active" 
-               ORDER BY s.start_time DESC LIMIT 1''',
+               LIMIT 1''',
             (driver_id,)
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return row
+        return dict(row) if row else None
 
-    async def get_organization_shifts(self, organization_id: int, limit: int = 50) -> List[Dict]:
-        """Получает смены организации"""
-        cursor = await self.connection.execute('''
-            SELECT s.id, s.start_time, s.end_time, s.status,
-                   d.full_name as driver_name,
-                   e.name as equipment_name, e.model as equipment_model
-            FROM shifts s
-            JOIN drivers d ON s.driver_id = d.telegram_id
-            JOIN equipment e ON s.equipment_id = e.id
-            WHERE s.organization_id = ?
-            ORDER BY s.start_time DESC
-            LIMIT ?
-        ''', (organization_id, limit))
-        rows = await cursor.fetchall()
-        await cursor.close()
-        
-        return [dict(row) for row in rows]
-
-    async def add_inspection_with_photos(self, shift_id: int, photo_ids: List[str], notes: str = "") -> int:
-        """Добавляет осмотр с фотографиями"""
-        photos_json = json.dumps(photo_ids) if photo_ids else None
-        
+    async def add_inspection(self, shift_id: int, photos: List[str], notes: str = "") -> int:
+        """Добавляет осмотр"""
+        photos_json = json.dumps(photos)
         cursor = await self.connection.execute(
             'INSERT INTO inspections (shift_id, check_type, photos, notes) VALUES (?, ?, ?, ?)',
             (shift_id, 'pre_shift', photos_json, notes)
@@ -415,9 +310,24 @@ class Database:
         await self.connection.commit()
         return cursor.lastrowid
 
+    async def get_user_shifts(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Получает смены пользователя"""
+        cursor = await self.connection.execute('''
+            SELECT s.id, s.start_time, s.end_time, s.status,
+                   e.name as equipment_name, e.model as equipment_model
+            FROM shifts s
+            JOIN equipment e ON s.equipment_id = e.id
+            WHERE s.driver_id = ?
+            ORDER BY s.start_time DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(row) for row in rows]
+
     async def close(self):
-        """Закрывает соединение с базой"""
+        """Закрывает соединение"""
         await self.connection.close()
 
-# Глобальный экземпляр базы данных
+# Глобальный экземпляр
 db = Database()
