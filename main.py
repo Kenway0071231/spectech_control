@@ -1,13 +1,12 @@
 import os
 import logging
 import asyncio
-from typing import Dict, List
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ContentType, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ContentType
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
@@ -16,14 +15,12 @@ from database import db, ROLES
 # ========== НАСТРОЙКА ==========
 load_dotenv()
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Оптимизация для быстрых ответов
 bot = Bot(
     token=os.getenv('BOT_TOKEN'),
     default=DefaultBotProperties(parse_mode="HTML")
@@ -31,7 +28,7 @@ bot = Bot(
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ========== СОСТОЯНИЯ ДЛЯ РАЗНЫХ РОЛЕЙ ==========
+# ========== СОСТОЯНИЯ ==========
 
 # Состояния для водителя
 class DriverStates(StatesGroup):
@@ -40,72 +37,59 @@ class DriverStates(StatesGroup):
     pre_inspection = State()
     waiting_for_photos = State()
 
-# Состояния для директора/начальника парка
-class AdminStates(StatesGroup):
-    waiting_for_new_username = State()
-    waiting_for_new_role = State()
-    waiting_for_equipment_name = State()
-    waiting_for_equipment_model = State()
-    waiting_for_equipment_vin = State()
-    waiting_for_organization_name = State()
+# Состояния для управления
+class ManagementStates(StatesGroup):
+    waiting_for_username = State()
+    waiting_for_user_role = State()
+    waiting_for_org_name = State()
+    waiting_for_eq_name = State()
+    waiting_for_eq_model = State()
+    waiting_for_eq_vin = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
-async def typing_action(chat_id: int):
-    """Показывает 'печатает...' для быстрого отклика"""
-    try:
-        await bot.send_chat_action(chat_id, "typing")
-        await asyncio.sleep(0.1)
-    except:
-        pass
-
 async def quick_reply(message: types.Message, text: str, **kwargs):
-    """Быстрый ответ пользователю"""
-    await typing_action(message.chat.id)
+    """Быстрый ответ"""
+    await bot.send_chat_action(message.chat.id, "typing")
+    await asyncio.sleep(0.1)
     return await message.answer(text, **kwargs)
 
-def get_role_keyboard(user_role: str, has_active_shift: bool = False) -> types.ReplyKeyboardMarkup:
-    """Генерирует клавиатуру в зависимости от роли"""
+def get_main_keyboard(user_role: str, org_id: int = None, has_active_shift: bool = False):
+    """Генерирует главное меню по роли"""
     
-    keyboards = {
+    base_buttons = {
         'botadmin': [
-            [types.KeyboardButton(text="👑 Панель администратора")],
-            [types.KeyboardButton(text="🏢 Организации")],
+            [types.KeyboardButton(text="👑 Админ-панель")],
+            [types.KeyboardButton(text="🏢 Все организации")],
             [types.KeyboardButton(text="👥 Все пользователи")],
             [types.KeyboardButton(text="➕ Назначить директора")],
-            [types.KeyboardButton(text="📊 Статистика")],
-            [types.KeyboardButton(text="⚙️ Настройки")]
+            [types.KeyboardButton(text="📊 Статистика")]
         ],
-        
         'director': [
-            [types.KeyboardButton(text="👨‍💼 Панель директора")],
-            [types.KeyboardButton(text="🏢 Моя организация")],
+            [types.KeyboardButton(text="👨‍💼 Моя организация")],
             [types.KeyboardButton(text="🚜 Автопарк")],
             [types.KeyboardButton(text="👥 Сотрудники")],
-            [types.KeyboardButton(text="➕ Назначить начальника парка")],
-            [types.KeyboardButton(text="➕ Назначить водителя")],
+            [types.KeyboardButton(text="➕ Добавить технику")],
+            [types.KeyboardButton(text="➕ Назначить сотрудника")],
             [types.KeyboardButton(text="📊 Отчеты")]
         ],
-        
         'fleetmanager': [
-            [types.KeyboardButton(text="👷 Панель начальника парка")],
+            [types.KeyboardButton(text="👷 Управление парком")],
             [types.KeyboardButton(text="🚜 Техника")],
             [types.KeyboardButton(text="👥 Водители")],
             [types.KeyboardButton(text="➕ Добавить технику")],
             [types.KeyboardButton(text="➕ Назначить водителя")],
             [types.KeyboardButton(text="📋 Активные смены")]
         ],
-        
         'driver': []
     }
     
-    # Для водителя меняем меню в зависимости от состояния смены
+    # Для водителя меняем меню
     if user_role == 'driver':
         if has_active_shift:
             buttons = [
                 [types.KeyboardButton(text="⏹️ Завершить смену")],
                 [types.KeyboardButton(text="📋 Мои смены")],
-                [types.KeyboardButton(text="📸 Мои фото")],
                 [types.KeyboardButton(text="ℹ️ Информация")]
             ]
         else:
@@ -114,760 +98,962 @@ def get_role_keyboard(user_role: str, has_active_shift: bool = False) -> types.R
                 [types.KeyboardButton(text="📋 Мои смены")],
                 [types.KeyboardButton(text="ℹ️ Информация")]
             ]
-        keyboards['driver'] = buttons
+        base_buttons['driver'] = buttons
+    
+    # Добавляем общие кнопки
+    if user_role in ['director', 'fleetmanager']:
+        base_buttons[user_role].append([types.KeyboardButton(text="🔙 Главное меню")])
     
     return types.ReplyKeyboardMarkup(
-        keyboard=keyboards[user_role],
+        keyboard=base_buttons[user_role],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие..."
     )
-
-async def get_user_menu(message: types.Message) -> types.ReplyKeyboardMarkup:
-    """Получает меню для текущего пользователя"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    # Проверяем активную смену (только для водителей)
-    has_active_shift = False
-    if user_role == 'driver':
-        active_shift = await db.get_active_shift(user_id)
-        has_active_shift = bool(active_shift)
-    
-    return get_role_keyboard(user_role, has_active_shift)
 
 # ========== КОМАНДА СТАРТ ==========
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    """Главное меню в зависимости от роли"""
-    await typing_action(message.chat.id)
-    
+    """Главное меню"""
     user_id = message.from_user.id
-    user_info = await db.get_user_info(user_id)
+    username = message.from_user.username
     
-    # Регистрируем пользователя, если его нет
-    if not user_info:
+    # Регистрируем пользователя
+    user = await db.get_user(user_id)
+    if not user:
         await db.register_user(
-            user_id,
-            f"{message.from_user.first_name} {message.from_user.last_name or ''}",
+            telegram_id=user_id,
+            full_name=f"{message.from_user.first_name} {message.from_user.last_name or ''}",
+            username=username,
             role='driver'
         )
-        user_info = await db.get_user_info(user_id)
+        user = await db.get_user(user_id)
     
-    user_role = user_info['role']
-    role_name = ROLES.get(user_role, {}).get('name', 'Неизвестно')
+    user_role = user['role']
+    role_name = ROLES.get(user_role, {}).get('name', 'Водитель')
+    org_id = user.get('organization_id')
     
-    welcome_texts = {
-        'botadmin': f"👑 <b>Добро пожаловать, Администратор!</b>\n\n",
-        'director': f"👨‍💼 <b>Добро пожаловать, Директор!</b>\n\n",
-        'fleetmanager': f"👷 <b>Добро пожаловать, Начальник парка!</b>\n\n",
-        'driver': f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+    # Проверяем активную смену (для водителей)
+    has_active_shift = False
+    if user_role == 'driver':
+        active_shift = await db.get_active_shift(user_id)
+        has_active_shift = bool(active_shift)
+    
+    welcome_text = {
+        'botadmin': "👑 <b>Панель администратора бота</b>",
+        'director': f"👨‍💼 <b>Директор компании</b>",
+        'fleetmanager': f"👷 <b>Начальник парка</b>",
+        'driver': f"👋 <b>Привет, {message.from_user.first_name}!</b>"
     }
-    
-    welcome = welcome_texts.get(user_role, f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n")
     
     await quick_reply(
         message,
-        f"{welcome}"
+        f"{welcome_text.get(user_role, '👋 Привет!')}\n\n"
         f"<b>Роль:</b> {role_name}\n"
-        f"<b>ID:</b> {user_id}\n\n"
-        f"Используйте меню ниже для работы:",
-        reply_markup=await get_user_menu(message)
+        f"<b>ID:</b> {user_id}\n"
+        f"{f'<b>Организация:</b> {org_id}' if org_id else ''}\n\n"
+        f"Используйте меню для работы:",
+        reply_markup=get_main_keyboard(user_role, org_id, has_active_shift)
     )
 
 # ========== МЕНЮ АДМИНИСТРАТОРА БОТА ==========
 
-@dp.message(F.text == "👑 Панель администратора")
-async def botadmin_panel(message: types.Message):
-    """Панель администратора бота"""
-    user_role = await db.get_user_role(message.from_user.id)
-    
-    if user_role != 'botadmin':
-        await quick_reply(message, "⛔ Доступ только для администратора бота!")
+@dp.message(F.text == "👑 Админ-панель")
+async def admin_panel(message: types.Message):
+    """Панель администратора"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'botadmin':
+        await quick_reply(message, "⛔ Доступ только для администратора!")
         return
-    
-    # Статистика
-    users = await db.get_users_by_role('director')
-    organizations = []
     
     await quick_reply(
         message,
-        "👑 <b>Панель администратора бота</b>\n\n"
-        "<b>Статистика:</b>\n"
-        f"• Директоров: {len(users)}\n"
-        f"• Организаций: {len(organizations)}\n"
-        f"• Всего пользователей: ...\n\n"
-        "<b>Доступные действия:</b>\n"
-        "1. Назначить директора\n"
-        "2. Просмотреть все организации\n"
-        "3. Управлять пользователями\n"
-        "4. Системные настройки"
+        "👑 <b>Панель администратора</b>\n\n"
+        "<b>Управление системой:</b>\n"
+        "• Создание организаций\n"
+        "• Назначение директоров\n"
+        "• Просмотр статистики\n"
+        "• Управление пользователями\n\n"
+        "Используйте меню ниже:"
     )
 
 @dp.message(F.text == "➕ Назначить директора")
 async def assign_director_start(message: types.Message, state: FSMContext):
-    """Начало процесса назначения директора"""
-    user_role = await db.get_user_role(message.from_user.id)
-    
-    if user_role != 'botadmin':
-        await quick_reply(message, "⛔ Доступ только для администратора бота!")
+    """Начинаем назначение директора"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'botadmin':
+        await quick_reply(message, "⛔ Доступ только для администратора!")
         return
     
     await quick_reply(
         message,
         "👨‍💼 <b>Назначение директора</b>\n\n"
-        "Для назначения директора компании:\n"
-        "1. Попросите пользователя написать боту /start\n"
-        "2. Получите его Telegram ID\n"
-        "3. Используйте команду:\n"
-        "<code>/setrole ID director</code>\n\n"
-        "<b>Пример:</b>\n"
-        "<code>/setrole 123456789 director</code>"
+        "Введите Telegram username пользователя (например, @username):",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
+    await state.set_state(ManagementStates.waiting_for_username)
 
-@dp.message(F.text == "👥 Все пользователи")
-async def show_all_users(message: types.Message):
-    """Показывает всех пользователей"""
-    user_role = await db.get_user_role(message.from_user.id)
-    
-    if user_role != 'botadmin':
-        await quick_reply(message, "⛔ Доступ только для администратора бота!")
+@dp.message(ManagementStates.waiting_for_username)
+async def process_username_for_director(message: types.Message, state: FSMContext):
+    """Обрабатываем username для назначения директора"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
         return
     
-    # Получаем пользователей по ролям
-    text = "👥 <b>Все пользователи</b>\n\n"
+    username = message.text.strip().replace('@', '')
+    await state.update_data(username=username)
     
-    for role_key, role_info in ROLES.items():
-        users = await db.get_users_by_role(role_key)
-        if users:
-            text += f"<b>{role_info['name']}:</b> {len(users)} чел.\n"
-            for user in users[:3]:  # Показываем только первых 3
-                text += f"• {user['full_name']} (ID: {user['telegram_id']})\n"
-            if len(users) > 3:
-                text += f"• ... и ещё {len(users) - 3}\n"
-            text += "\n"
+    await quick_reply(
+        message,
+        f"✅ Username получен: @{username}\n\n"
+        "Теперь создайте организацию для нового директора.\n"
+        "Введите название организации:",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(ManagementStates.waiting_for_org_name)
+
+@dp.message(ManagementStates.waiting_for_org_name)
+async def process_org_name_for_director(message: types.Message, state: FSMContext):
+    """Обрабатываем название организации"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
     
-    await quick_reply(message, text)
+    org_name = message.text.strip()
+    data = await state.get_data()
+    username = data['username']
+    
+    await quick_reply(
+        message,
+        f"🏢 <b>Создание организации</b>\n\n"
+        f"Название: {org_name}\n"
+        f"Директор: @{username}\n\n"
+        f"Для завершения попросите пользователя @{username} "
+        f"написать боту /start, а затем используйте команду:\n\n"
+        f"<code>/setrole @{username} director</code>\n\n"
+        f"После этого создайте организацию командой:\n"
+        f"<code>/createorg \"{org_name}\"</code>"
+    )
+    
+    await state.clear()
+    await cmd_start(message)
 
 # ========== МЕНЮ ДИРЕКТОРА ==========
 
-@dp.message(F.text == "👨‍💼 Панель директора")
-async def director_panel(message: types.Message):
-    """Панель директора компании"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role != 'director':
+@dp.message(F.text == "👨‍💼 Моя организация")
+async def director_organization(message: types.Message):
+    """Управление организацией директора"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'director':
         await quick_reply(message, "⛔ Доступ только для директора!")
         return
     
-    # Получаем информацию об организации
-    org_id = await db.get_user_organization(user_id)
-    org_info = await db.get_organization_info(org_id) if org_id else None
+    org_id = user.get('organization_id')
+    if not org_id:
+        await quick_reply(
+            message,
+            "🏢 <b>Создание организации</b>\n\n"
+            "У вас ещё нет организации.\n"
+            "Создайте её командой:\n"
+            "<code>/createorg Название компании</code>\n\n"
+            "<b>Пример:</b>\n"
+            "<code>/createorg ООО 'Моя компания'</code>"
+        )
+        return
     
-    # Статистика
-    fleetmanagers = await db.get_users_by_role('fleetmanager', org_id)
-    drivers = await db.get_users_by_role('driver', org_id)
-    equipment = await db.get_equipment_list(org_id)
-    shifts = await db.get_organization_shifts(org_id, 5) if org_id else []
+    org = await db.get_organization(org_id)
+    users = await db.get_organization_users(org_id)
+    equipment = await db.get_organization_equipment(org_id)
     
-    org_name = org_info['name'] if org_info else "Организация не создана"
+    # Статистика по ролям
+    roles_count = {'director': 0, 'fleetmanager': 0, 'driver': 0}
+    for u in users:
+        roles_count[u['role']] = roles_count.get(u['role'], 0) + 1
     
     text = (
-        f"👨‍💼 <b>Панель директора</b>\n\n"
-        f"<b>Организация:</b> {org_name}\n"
-        f"<b>ID организации:</b> {org_id or 'нет'}\n\n"
-        f"<b>Статистика:</b>\n"
-        f"• Начальников парка: {len(fleetmanagers)}\n"
-        f"• Водителей: {len(drivers)}\n"
-        f"• Техники: {len(equipment)}\n"
-        f"• Последние смены: {len(shifts)}\n\n"
-        f"<b>Управление:</b>\n"
-        f"1. Создать/изменить организацию\n"
-        f"2. Назначить начальника парка\n"
-        f"3. Назначить водителя\n"
-        f"4. Просмотреть автопарк\n"
-        f"5. Смотреть отчеты"
-    )
-    
-    await quick_reply(message, text)
-
-@dp.message(F.text == "➕ Назначить начальника парка")
-async def assign_fleetmanager_start(message: types.Message, state: FSMContext):
-    """Начало назначения начальника парка"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role != 'director':
-        await quick_reply(message, "⛔ Доступ только для директора!")
-        return
-    
-    org_id = await db.get_user_organization(user_id)
-    if not org_id:
-        await quick_reply(message, "❌ Сначала создайте организацию!")
-        return
-    
-    await quick_reply(
-        message,
-        "👷 <b>Назначение начальника парка</b>\n\n"
-        "Для назначения начальника парка:\n"
-        "1. Попросите пользователя написать боту /start\n"
-        "2. Получите его Telegram ID\n"
-        "3. Используйте команду:\n"
-        f"<code>/setrole ID fleetmanager {org_id}</code>\n\n"
-        "<b>Пример:</b>\n"
-        f"<code>/setrole 987654321 fleetmanager {org_id}</code>"
-    )
-
-@dp.message(F.text == "➕ Назначить водителя")
-async def assign_driver_start(message: types.Message, state: FSMContext):
-    """Начало назначения водителя"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role not in ['director', 'fleetmanager']:
-        await quick_reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = await db.get_user_organization(user_id)
-    if not org_id:
-        await quick_reply(message, "❌ Сначала создайте организацию!")
-        return
-    
-    role_name = "директора" if user_role == 'director' else "начальника парка"
-    
-    await quick_reply(
-        message,
-        f"🚛 <b>Назначение водителя ({role_name})</b>\n\n"
-        "Для назначения водителя:\n"
-        "1. Попросите пользователя написать боту /start\n"
-        "2. Получите его Telegram ID\n"
-        "3. Используйте команду:\n"
-        f"<code>/setrole ID driver {org_id}</code>\n\n"
-        "<b>Пример:</b>\n"
-        f"<code>/setrole 555555555 driver {org_id}</code>"
-    )
-
-@dp.message(F.text == "🏢 Моя организация")
-async def show_organization(message: types.Message):
-    """Показывает информацию об организации"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role not in ['director', 'fleetmanager']:
-        await quick_reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = await db.get_user_organization(user_id)
-    
-    if not org_id:
-        # Предлагаем создать организацию
-        if user_role == 'director':
-            await quick_reply(
-                message,
-                "🏢 <b>Создание организации</b>\n\n"
-                "У вас ещё нет организации.\n"
-                "Чтобы создать организацию, используйте команду:\n"
-                "<code>/createorg Название компании</code>\n\n"
-                "<b>Пример:</b>\n"
-                "<code>/createorg ООО 'СпецТех'</code>"
-            )
-        else:
-            await quick_reply(message, "❌ Вы не привязаны к организации. Обратитесь к директору.")
-        return
-    
-    org_info = await db.get_organization_info(org_id)
-    users = await db.get_users_in_organization(org_id)
-    equipment = await db.get_equipment_list(org_id)
-    
-    text = (
-        f"🏢 <b>Организация: {org_info['name']}</b>\n\n"
+        f"🏢 <b>Организация: {org['name']}</b>\n\n"
         f"<b>ID:</b> {org_id}\n"
-        f"<b>Создана:</b> {org_info['created_at'][:10]}\n\n"
-        f"<b>Сотрудники ({len(users)}):</b>\n"
+        f"<b>Директор:</b> {user['full_name']}\n"
+        f"<b>Создана:</b> {org['created_at'][:10]}\n\n"
+        f"<b>Сотрудники:</b>\n"
+        f"• Директор: {roles_count['director']}\n"
+        f"• Начальники парка: {roles_count['fleetmanager']}\n"
+        f"• Водители: {roles_count['driver']}\n"
+        f"<b>Техника:</b> {len(equipment)} ед.\n\n"
+        f"<b>Управление:</b>\n"
+        f"1. Добавить технику\n"
+        f"2. Назначить сотрудников\n"
+        f"3. Просмотреть отчеты"
     )
-    
-    # Группируем по ролям
-    roles_count = {}
-    for user in users:
-        role = user['role']
-        roles_count[role] = roles_count.get(role, 0) + 1
-    
-    for role_key, count in roles_count.items():
-        role_name = ROLES.get(role_key, {}).get('name', role_key)
-        text += f"• {role_name}: {count} чел.\n"
-    
-    text += f"\n<b>Техника ({len(equipment)}):</b>\n"
-    
-    status_count = {}
-    for eq in equipment:
-        status = eq[3]  # status на позиции 3
-        status_count[status] = status_count.get(status, 0) + 1
-    
-    for status, count in status_count.items():
-        text += f"• {status}: {count} ед.\n"
     
     await quick_reply(message, text)
 
-# ========== МЕНЮ НАЧАЛЬНИКА ПАРКА ==========
-
-@dp.message(F.text == "👷 Панель начальника парка")
-async def fleetmanager_panel(message: types.Message):
-    """Панель начальника парка"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role != 'fleetmanager':
-        await quick_reply(message, "⛔ Доступ только для начальника парка!")
+@dp.message(F.text == "➕ Назначить сотрудника")
+async def assign_employee_start(message: types.Message, state: FSMContext):
+    """Начинаем назначение сотрудника"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'director':
+        await quick_reply(message, "⛔ Доступ только для директора!")
         return
     
-    org_id = await db.get_user_organization(user_id)
-    
+    org_id = user.get('organization_id')
     if not org_id:
-        await quick_reply(message, "❌ Вы не привязаны к организации. Обратитесь к директору.")
+        await quick_reply(message, "❌ Сначала создайте организацию!")
         return
     
-    # Статистика
-    drivers = await db.get_users_by_role('driver', org_id)
-    equipment = await db.get_equipment_list(org_id)
-    active_shifts = await db.get_organization_shifts(org_id)
-    active_shifts = [s for s in active_shifts if s['status'] == 'active']
+    await state.update_data(org_id=org_id)
     
     await quick_reply(
         message,
-        "👷 <b>Панель начальника парка</b>\n\n"
-        f"<b>Статистика:</b>\n"
-        f"• Водителей: {len(drivers)}\n"
-        f"• Техники: {len(equipment)}\n"
-        f"• Активных смен: {len(active_shifts)}\n\n"
-        f"<b>Управление:</b>\n"
-        f"1. Просмотреть технику\n"
-        f"2. Добавить технику\n"
-        f"3. Просмотреть водителей\n"
-        f"4. Назначить водителя\n"
-        f"5. Активные смены\n"
-        f"6. Отчеты по технике"
+        "👥 <b>Назначение сотрудника</b>\n\n"
+        "Выберите роль для назначения:",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="👷 Начальник парка")],
+                [types.KeyboardButton(text="🚛 Водитель")],
+                [types.KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True
+        )
     )
+    await state.set_state(ManagementStates.waiting_for_user_role)
 
-@dp.message(F.text == "🚜 Техника")
+@dp.message(ManagementStates.waiting_for_user_role)
+async def process_role_for_employee(message: types.Message, state: FSMContext):
+    """Обрабатываем выбор роли"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    role_map = {
+        "👷 Начальник парка": "fleetmanager",
+        "🚛 Водитель": "driver"
+    }
+    
+    if message.text not in role_map:
+        await quick_reply(message, "⚠️ Выберите роль из списка!")
+        return
+    
+    target_role = role_map[message.text]
+    await state.update_data(target_role=target_role)
+    
+    await quick_reply(
+        message,
+        f"✅ Роль выбрана: {message.text}\n\n"
+        f"Введите Telegram username сотрудника (например, @username):",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(ManagementStates.waiting_for_username)
+
+@dp.message(ManagementStates.waiting_for_username)
+async def process_username_for_employee(message: types.Message, state: FSMContext):
+    """Обрабатываем username сотрудника"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    username = message.text.strip().replace('@', '')
+    data = await state.get_data()
+    org_id = data['org_id']
+    target_role = data['target_role']
+    
+    role_name = "начальника парка" if target_role == 'fleetmanager' else "водителя"
+    
+    await quick_reply(
+        message,
+        f"✅ <b>Готово к назначению!</b>\n\n"
+        f"Сотрудник: @{username}\n"
+        f"Роль: {role_name}\n"
+        f"Организация: {org_id}\n\n"
+        f"Попросите сотрудника @{username} написать боту /start,\n"
+        f"а затем используйте команду:\n\n"
+        f"<code>/setrole @{username} {target_role} {org_id}</code>"
+    )
+    
+    await state.clear()
+    await cmd_start(message)
+
+@dp.message(F.text == "🚜 Автопарк")
 async def show_equipment(message: types.Message):
     """Показывает технику организации"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role not in ['director', 'fleetmanager']:
+    user = await db.get_user(message.from_user.id)
+    if user['role'] not in ['director', 'fleetmanager']:
         await quick_reply(message, "⛔ Доступ только для директора или начальника парка!")
         return
     
-    org_id = await db.get_user_organization(user_id)
-    
+    org_id = user.get('organization_id')
     if not org_id:
-        await quick_reply(message, "❌ Вы не привязаны к организации.")
+        await quick_reply(message, "❌ Вы не привязаны к организации!")
         return
     
-    equipment = await db.get_equipment_list(org_id)
+    equipment = await db.get_organization_equipment(org_id)
     
     if not equipment:
         await quick_reply(
             message,
-            "🚜 <b>Техника организации</b>\n\n"
+            "🚜 <b>Автопарк</b>\n\n"
             "Техники пока нет.\n"
             "Добавьте технику через меню."
         )
         return
     
-    text = f"🚜 <b>Техника организации ({len(equipment)} ед.)</b>\n\n"
+    text = f"🚜 <b>Автопарк ({len(equipment)} ед.)</b>\n\n"
     
-    for i, eq in enumerate(equipment[:10], 1):  # Показываем первые 10
-        eq_id, name, model, status = eq
-        status_icon = "🟢" if status == 'active' else "🔴" if status == 'broken' else "🟡"
-        text += f"{status_icon} <b>{name}</b> ({model})\n"
-        text += f"   ID: {eq_id} | Статус: {status}\n\n"
+    for eq in equipment[:10]:
+        status_icon = "🟢" if eq['status'] == 'active' else "🔴"
+        text += f"{status_icon} <b>{eq['name']}</b> ({eq['model']})\n"
+        text += f"   Статус: {eq['status']}\n\n"
     
     if len(equipment) > 10:
-        text += f"... и ещё {len(equipment) - 10} единиц техники"
+        text += f"... и ещё {len(equipment) - 10} единиц"
     
     await quick_reply(message, text)
 
 @dp.message(F.text == "➕ Добавить технику")
 async def add_equipment_start(message: types.Message, state: FSMContext):
-    """Начало добавления техники"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role not in ['director', 'fleetmanager']:
+    """Начинаем добавление техники"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] not in ['director', 'fleetmanager']:
         await quick_reply(message, "⛔ Доступ только для директора или начальника парка!")
         return
     
-    org_id = await db.get_user_organization(user_id)
-    
+    org_id = user.get('organization_id')
     if not org_id:
-        await quick_reply(message, "❌ Вы не привязаны к организации.")
+        await quick_reply(message, "❌ Вы не привязаны к организации!")
         return
+    
+    await state.update_data(org_id=org_id, user_id=user['telegram_id'])
     
     await quick_reply(
         message,
-        "➕ <b>Добавление техники</b>\n\n"
-        "Для добавления техники используйте команду:\n"
-        "<code>/addeq Название Модель VIN</code>\n\n"
-        "<b>Пример:</b>\n"
-        "<code>/addeq Экскаватор CAT-320 CAT123456789</code>\n\n"
-        "<i>VIN должен быть уникальным</i>"
+        "🚜 <b>Добавление техники</b>\n\n"
+        "Введите название техники:",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(ManagementStates.waiting_for_eq_name)
+
+@dp.message(ManagementStates.waiting_for_eq_name)
+async def process_eq_name(message: types.Message, state: FSMContext):
+    """Обрабатываем название техники"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    await state.update_data(eq_name=message.text)
+    
+    await quick_reply(
+        message,
+        "✅ Название принято!\n\n"
+        "Теперь введите модель техники:"
+    )
+    await state.set_state(ManagementStates.waiting_for_eq_model)
+
+@dp.message(ManagementStates.waiting_for_eq_model)
+async def process_eq_model(message: types.Message, state: FSMContext):
+    """Обрабатываем модель техники"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    await state.update_data(eq_model=message.text)
+    
+    await quick_reply(
+        message,
+        "✅ Модель принята!\n\n"
+        "Теперь введите VIN (уникальный номер):"
+    )
+    await state.set_state(ManagementStates.waiting_for_eq_vin)
+
+@dp.message(ManagementStates.waiting_for_eq_vin)
+async def process_eq_vin(message: types.Message, state: FSMContext):
+    """Обрабатываем VIN и сохраняем технику"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    data = await state.get_data()
+    org_id = data['org_id']
+    user_id = data['user_id']
+    eq_name = data['eq_name']
+    eq_model = data['eq_model']
+    eq_vin = message.text
+    
+    # Добавляем технику
+    eq_id = await db.add_equipment(eq_name, eq_model, eq_vin, org_id, user_id)
+    
+    if eq_id:
+        await quick_reply(
+            message,
+            f"✅ <b>Техника добавлена!</b>\n\n"
+            f"<b>Название:</b> {eq_name}\n"
+            f"<b>Модель:</b> {eq_model}\n"
+            f"<b>VIN:</b> {eq_vin}\n"
+            f"<b>ID:</b> {eq_id}\n\n"
+            f"Техника доступна для использования."
+        )
+    else:
+        await quick_reply(
+            message,
+            "❌ <b>Ошибка добавления техники</b>\n\n"
+            "Возможно, техника с таким VIN уже существует."
+        )
+    
+    await state.clear()
+    await cmd_start(message)
+
+# ========== МЕНЮ НАЧАЛЬНИКА ПАРКА ==========
+
+@dp.message(F.text == "👷 Управление парком")
+async def fleetmanager_panel(message: types.Message):
+    """Панель начальника парка"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'fleetmanager':
+        await quick_reply(message, "⛔ Доступ только для начальника парка!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await quick_reply(message, "❌ Вы не привязаны к организации! Обратитесь к директору.")
+        return
+    
+    # Получаем статистику
+    users = await db.get_organization_users(org_id)
+    equipment = await db.get_organization_equipment(org_id)
+    
+    drivers_count = len([u for u in users if u['role'] == 'driver'])
+    active_equipment = len([e for e in equipment if e['status'] == 'active'])
+    
+    await quick_reply(
+        message,
+        "👷 <b>Управление парком</b>\n\n"
+        f"<b>Водителей:</b> {drivers_count}\n"
+        f"<b>Техники:</b> {len(equipment)} ед.\n"
+        f"<b>Активной техники:</b> {active_equipment}\n\n"
+        "<b>Доступные действия:</b>\n"
+        "• Просмотр техники\n"
+        "• Добавление техники\n"
+        "• Назначение водителей\n"
+        "• Просмотр активных смен"
     )
 
-# ========== МЕНЮ ВОДИТЕЛЯ (существующий функционал) ==========
+@dp.message(F.text == "👥 Водители")
+async def show_drivers(message: types.Message):
+    """Показывает водителей организации"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] not in ['director', 'fleetmanager']:
+        await quick_reply(message, "⛔ Доступ только для директора или начальника парка!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await quick_reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    users = await db.get_organization_users(org_id)
+    drivers = [u for u in users if u['role'] == 'driver']
+    
+    if not drivers:
+        await quick_reply(
+            message,
+            "👥 <b>Водители</b>\n\n"
+            "Водителей пока нет.\n"
+            "Назначьте водителей через меню."
+        )
+        return
+    
+    text = f"👥 <b>Водители ({len(drivers)} чел.)</b>\n\n"
+    
+    for driver in drivers[:10]:
+        text += f"🚛 <b>{driver['full_name']}</b>\n"
+        if driver['username']:
+            text += f"   @{driver['username']}\n"
+        text += f"   ID: {driver['telegram_id']}\n\n"
+    
+    if len(drivers) > 10:
+        text += f"... и ещё {len(drivers) - 10} водителей"
+    
+    await quick_reply(message, text)
+
+@dp.message(F.text == "➕ Назначить водителя")
+async def assign_driver_fleetmanager(message: types.Message, state: FSMContext):
+    """Начальник парка назначает водителя"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'fleetmanager':
+        await quick_reply(message, "⛔ Доступ только для начальника парка!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await quick_reply(message, "❌ Вы не привязаны к организации! Обратитесь к директору.")
+        return
+    
+    await state.update_data(org_id=org_id)
+    
+    await quick_reply(
+        message,
+        "🚛 <b>Назначение водителя</b>\n\n"
+        "Введите Telegram username водителя (например, @username):",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(ManagementStates.waiting_for_username)
+
+# ========== МЕНЮ ВОДИТЕЛЯ ==========
 
 @dp.message(F.text == "🚛 Начать смену")
 async def start_shift_process(message: types.Message, state: FSMContext):
-    """Начинает процесс начала смены"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role != 'driver':
+    """Начинает смену"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'driver':
         await quick_reply(message, "⛔ Только водители могут начинать смены!")
         return
     
-    org_id = await db.get_user_organization(user_id)
+    # Проверяем активную смену
+    active_shift = await db.get_active_shift(user['telegram_id'])
+    if active_shift:
+        await quick_reply(
+            message,
+            f"⚠️ <b>У вас уже есть активная смена!</b>\n\n"
+            f"Завершите текущую смену перед началом новой."
+        )
+        return
     
+    org_id = user.get('organization_id')
     if not org_id:
-        await quick_reply(message, "❌ Вы не привязаны к организации. Обратитесь к начальнику парка.")
+        await quick_reply(message, "❌ Вы не привязаны к организации! Обратитесь к начальнику парка.")
         return
     
-    equipment = await db.get_equipment_list(org_id)
-    
-    if not equipment:
-        await quick_reply(message, "❌ В вашей организации нет техники.")
-        return
-    
-    # Фильтруем только активную технику
-    active_equipment = [eq for eq in equipment if eq[3] == 'active']
+    equipment = await db.get_organization_equipment(org_id)
+    active_equipment = [e for e in equipment if e['status'] == 'active']
     
     if not active_equipment:
         await quick_reply(message, "❌ Нет доступной активной техники.")
         return
     
     keyboard = []
-    for eq in active_equipment[:5]:  # Ограничиваем 5 элементами
-        eq_id, name, model, status = eq
-        keyboard.append([types.KeyboardButton(text=f"🚜 {name}")])
+    for eq in active_equipment[:5]:
+        keyboard.append([types.KeyboardButton(text=f"🚜 {eq['name']}")])
     
     keyboard.append([types.KeyboardButton(text="❌ Отмена")])
     
     await quick_reply(
         message,
         "🚛 <b>Выберите технику:</b>\n\n"
-        f"Доступно техники: {len(active_equipment)} ед.\n"
-        "Нажмите на нужную технику ниже:",
+        f"Доступно техники: {len(active_equipment)} ед.",
         reply_markup=types.ReplyKeyboardMarkup(
             keyboard=keyboard,
             resize_keyboard=True
         )
     )
     
-    await state.update_data(equipment_list=active_equipment, org_id=org_id)
+    await state.update_data(equipment_list=active_equipment)
     await state.set_state(DriverStates.choosing_equipment)
 
-# [Остальные обработчики для водителя остаются аналогичными предыдущей версии,
-#  но с учетом organization_id]
+@dp.message(DriverStates.choosing_equipment)
+async def process_equipment_choice(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор техники"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    data = await state.get_data()
+    equipment_list = data.get('equipment_list', [])
+    
+    # Ищем выбранную технику
+    selected_eq = None
+    search_text = message.text.replace("🚜 ", "").strip()
+    
+    for eq in equipment_list:
+        if search_text in eq['name']:
+            selected_eq = eq
+            break
+    
+    if not selected_eq:
+        await quick_reply(message, "⚠️ Выберите технику из списка!")
+        return
+    
+    await state.update_data(selected_equipment=selected_eq)
+    
+    await quick_reply(
+        message,
+        f"📋 <b>Инструктаж по безопасности</b>\n\n"
+        f"<b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n\n"
+        "Основные правила:\n"
+        "1. Проверьте средства пожаротушения\n"
+        "2. Убедитесь в исправности ремней\n"
+        "3. Проверьте сигналы и огни\n"
+        "4. Осмотрите на утечки\n"
+        "5. Проверьте давление в шинах\n\n"
+        "Подтвердите ознакомление:",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="✅ Подтверждаю")],
+                [types.KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True
+        )
+    )
+    
+    await state.set_state(DriverStates.safety_instruction)
 
-# ========== КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ РОЛЯМИ ==========
+@dp.message(DriverStates.safety_instruction)
+async def process_safety_instruction(message: types.Message, state: FSMContext):
+    """Обрабатывает подтверждение инструктажа"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await cmd_start(message)
+        return
+    
+    if message.text != "✅ Подтверждаю":
+        await quick_reply(message, "⚠️ Нажмите '✅ Подтверждаю' для продолжения!")
+        return
+    
+    await quick_reply(
+        message,
+        "🔍 <b>Предсменный осмотр</b>\n\n"
+        "Проверьте основные узлы:\n"
+        "• Уровень масла и жидкости\n"
+        "• Гидравлические шланги\n"
+        "• Работу приборов\n\n"
+        "Вы можете добавить фото или продолжить:",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="📷 Сделать фото")],
+                [types.KeyboardButton(text="⏭️ Без фото")],
+                [types.KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True
+        )
+    )
+    
+    await state.update_data(inspection_photos=[])
+    await state.set_state(DriverStates.pre_inspection)
+
+@dp.message(DriverStates.pre_inspection, F.text == "📷 Сделать фото")
+async def request_photos(message: types.Message, state: FSMContext):
+    """Запрашивает фото"""
+    await quick_reply(
+        message,
+        "📸 <b>Отправьте фотографии</b>\n\n"
+        "Можно отправить несколько фото сразу.\n"
+        "После отправки нажмите '✅ Готово'.",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="✅ Готово")],
+                [types.KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(DriverStates.waiting_for_photos)
+
+@dp.message(DriverStates.pre_inspection, F.text == "⏭️ Без фото")
+async def skip_photos(message: types.Message, state: FSMContext):
+    """Пропускает фото и начинает смену"""
+    await complete_shift_start(message, state, photos=[])
+
+async def complete_shift_start(message: types.Message, state: FSMContext, photos=None):
+    """Завершает начало смены"""
+    data = await state.get_data()
+    selected_eq = data.get('selected_equipment')
+    
+    if not selected_eq:
+        await quick_reply(message, "❌ Ошибка: данные не найдены!")
+        await state.clear()
+        return
+    
+    # Начинаем смену
+    shift_id = await db.start_shift(message.from_user.id, selected_eq['id'])
+    
+    # Сохраняем фото если есть
+    if photos:
+        await db.add_inspection(shift_id, photos, f"Осмотр {selected_eq['name']}")
+    
+    await quick_reply(
+        message,
+        f"🎉 <b>Смена начата!</b>\n\n"
+        f"<b>Техника:</b> {selected_eq['name']}\n"
+        f"<b>ID смены:</b> {shift_id}\n"
+        f"<b>Время:</b> {message.date.strftime('%H:%M')}\n"
+        f"<b>Фото:</b> {len(photos) if photos else 0} шт.\n\n"
+        f"Удачной работы! 🚀"
+    )
+    
+    await state.clear()
+    await cmd_start(message)
+
+@dp.message(F.text == "⏹️ Завершить смену")
+async def end_shift_process(message: types.Message):
+    """Завершает смену"""
+    active_shift = await db.get_active_shift(message.from_user.id)
+    
+    if not active_shift:
+        await quick_reply(message, "❌ У вас нет активной смены!")
+        return
+    
+    await db.end_shift(active_shift['id'])
+    
+    await quick_reply(
+        message,
+        f"✅ <b>Смена завершена!</b>\n\n"
+        f"<b>Техника:</b> {active_shift['name']}\n"
+        f"<b>ID смены:</b> {active_shift['id']}\n"
+        f"<b>Время:</b> {message.date.strftime('%H:%M')}\n\n"
+        f"Спасибо за работу! 👷"
+    )
+    
+    await cmd_start(message)
+
+@dp.message(F.text == "📋 Мои смены")
+async def show_my_shifts(message: types.Message):
+    """Показывает смены пользователя"""
+    shifts = await db.get_user_shifts(message.from_user.id, limit=5)
+    
+    if not shifts:
+        await quick_reply(
+            message,
+            "📋 <b>Мои смены</b>\n\n"
+            "У вас ещё не было смен.\n"
+            "Начните первую смену!"
+        )
+        return
+    
+    text = "📋 <b>Последние смены</b>\n\n"
+    
+    for shift in shifts:
+        status_icon = "🟢" if shift['status'] == 'active' else "✅"
+        start_time = shift['start_time'][:16]
+        end_time = shift['end_time'][:16] if shift['end_time'] else "в процессе"
+        
+        text += f"{status_icon} <b>{shift['equipment_name']}</b>\n"
+        text += f"   Начало: {start_time}\n"
+        text += f"   Окончание: {end_time}\n"
+        text += f"   Статус: {shift['status']}\n\n"
+    
+    await quick_reply(message, text)
+
+# ========== КОМАНДЫ ДЛЯ ОБСЛУЖИВАНИЯ ==========
 
 @dp.message(Command("setrole"))
 async def set_role_command(message: types.Message):
-    """Команда для установки роли пользователя"""
+    """Команда для назначения роли"""
     try:
         parts = message.text.split()
         
         if len(parts) < 3:
             await quick_reply(
                 message,
-                "❌ <b>Неверный формат команды</b>\n\n"
+                "❌ <b>Неверный формат</b>\n\n"
                 "<b>Использование:</b>\n"
-                "<code>/setrole USER_ID ROLE [ORG_ID]</code>\n\n"
+                "<code>/setrole USERNAME ROLE [ORG_ID]</code>\n\n"
                 "<b>Примеры:</b>\n"
-                "<code>/setrole 123456789 director</code>\n"
-                "<code>/setrole 987654321 driver 1</code>"
+                "<code>/setrole @username director</code>\n"
+                "<code>/setrole @username driver 1</code>"
             )
             return
         
-        target_id = int(parts[1])
+        username = parts[1].replace('@', '')
         new_role = parts[2].lower()
         org_id = int(parts[3]) if len(parts) > 3 else None
         
-        # Проверяем существование роли
-        if new_role not in ROLES:
+        # Находим пользователя по username
+        cursor = await db.connection.execute(
+            'SELECT telegram_id, full_name FROM users WHERE username = ?',
+            (username,)
+        )
+        user_row = await cursor.fetchone()
+        await cursor.close()
+        
+        if not user_row:
             await quick_reply(
                 message,
-                f"❌ <b>Неизвестная роль:</b> {new_role}\n\n"
-                f"<b>Доступные роли:</b>\n"
-                f"{', '.join(ROLES.keys())}"
+                f"❌ <b>Пользователь @{username} не найден!</b>\n\n"
+                f"Попросите пользователя написать боту /start."
             )
             return
         
+        target_id = user_row['telegram_id']
+        
         # Меняем роль
-        success = await db.change_user_role(
-            telegram_id=target_id,
-            new_role=new_role,
-            changed_by=message.from_user.id,
-            organization_id=org_id
-        )
+        success = await db.update_user_role(target_id, new_role, org_id)
         
         if success:
-            role_name = ROLES[new_role]['name']
+            role_name = ROLES.get(new_role, {}).get('name', new_role)
             await quick_reply(
                 message,
-                f"✅ <b>Роль успешно изменена!</b>\n\n"
-                f"<b>Пользователь:</b> {target_id}\n"
-                f"<b>Новая роль:</b> {role_name}\n"
-                f"<b>Организация:</b> {org_id or 'не указана'}"
+                f"✅ <b>Роль назначена!</b>\n\n"
+                f"<b>Пользователь:</b> @{username}\n"
+                f"<b>Роль:</b> {role_name}\n"
+                f"{f'<b>Организация:</b> {org_id}' if org_id else ''}"
             )
-            
-            # Уведомляем пользователя
-            try:
-                await bot.send_message(
-                    target_id,
-                    f"🎉 <b>Ваша роль изменена!</b>\n\n"
-                    f"Вам назначена роль: <b>{role_name}</b>\n"
-                    f"Назначил: {message.from_user.full_name}\n\n"
-                    f"Перезапустите бота командой /start"
-                )
-            except:
-                pass
         else:
-            await quick_reply(
-                message,
-                f"❌ <b>Не удалось изменить роль</b>\n\n"
-                f"Возможные причины:\n"
-                f"1. Нет прав на назначение этой роли\n"
-                f"2. Пользователь не найден\n"
-                f"3. Ошибка базы данных"
-            )
+            await quick_reply(message, "❌ Ошибка назначения роли!")
             
-    except ValueError:
-        await quick_reply(message, "❌ Неверный формат ID. ID должен быть числом.")
     except Exception as e:
         logger.error(f"Ошибка в setrole: {e}")
         await quick_reply(message, f"❌ Ошибка: {str(e)}")
 
 @dp.message(Command("createorg"))
-async def create_organization_command(message: types.Message):
+async def create_org_command(message: types.Message):
     """Создает организацию"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
+    try:
+        parts = message.text.split(maxsplit=1)
+        
+        if len(parts) < 2:
+            await quick_reply(
+                message,
+                "❌ <b>Неверный формат</b>\n\n"
+                "<b>Использование:</b>\n"
+                "<code>/createorg Название организации</code>\n\n"
+                "<b>Пример:</b>\n"
+                "<code>/createorg ООО 'Моя компания'</code>"
+            )
+            return
+        
+        org_name = parts[1]
+        user_id = message.from_user.id
+        
+        # Проверяем, что пользователь - директор
+        user = await db.get_user(user_id)
+        if user['role'] != 'director':
+            await quick_reply(message, "⛔ Только директора могут создавать организации!")
+            return
+        
+        # Проверяем, нет ли уже организации
+        if user.get('organization_id'):
+            await quick_reply(message, "⚠️ У вас уже есть организация!")
+            return
+        
+        # Создаем организацию
+        org_id = await db.create_organization(org_name, user_id)
+        
+        if org_id:
+            await quick_reply(
+                message,
+                f"✅ <b>Организация создана!</b>\n\n"
+                f"<b>Название:</b> {org_name}\n"
+                f"<b>ID:</b> {org_id}\n\n"
+                f"Теперь вы можете:\n"
+                f"• Добавлять технику\n"
+                f"• Назначать сотрудников\n"
+                f"• Управлять парком"
+            )
+        else:
+            await quick_reply(message, "❌ Ошибка создания организации!")
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания организации: {e}")
+        await quick_reply(message, f"❌ Ошибка: {str(e)}")
+
+@dp.message(Command("myrole"))
+async def myrole_command(message: types.Message):
+    """Показывает роль пользователя"""
+    user = await db.get_user(message.from_user.id)
     
-    if user_role != 'director':
-        await quick_reply(message, "⛔ Только директора могут создавать организации!")
+    if not user:
+        await quick_reply(message, "❌ Вы не зарегистрированы!")
         return
     
-    parts = message.text.split(maxsplit=1)
+    role_name = ROLES.get(user['role'], {}).get('name', user['role'])
+    org_info = ""
     
-    if len(parts) < 2:
-        await quick_reply(
-            message,
-            "❌ <b>Неверный формат команды</b>\n\n"
-            "<b>Использование:</b>\n"
-            "<code>/createorg Название организации</code>\n\n"
-            "<b>Пример:</b>\n"
-            "<code>/createorg ООО 'СпецТех Север'</code>"
-        )
-        return
-    
-    org_name = parts[1]
-    
-    # Проверяем, нет ли уже организации у директора
-    existing_org = await db.get_user_organization(user_id)
-    if existing_org:
-        await quick_reply(
-            message,
-            f"⚠️ <b>У вас уже есть организация!</b>\n\n"
-            f"Используйте команду /myorg для просмотра\n"
-            f"или обратитесь к администратору для изменения."
-        )
-        return
-    
-    # Создаем организацию
-    org_id = await db.create_organization(org_name, user_id)
+    if user.get('organization_id'):
+        org = await db.get_organization(user['organization_id'])
+        if org:
+            org_info = f"<b>Организация:</b> {org['name']} (ID: {org['id']})\n"
     
     await quick_reply(
         message,
-        f"✅ <b>Организация создана!</b>\n\n"
-        f"<b>Название:</b> {org_name}\n"
-        f"<b>ID организации:</b> {org_id}\n"
-        f"<b>Директор:</b> {message.from_user.full_name}\n\n"
-        f"Теперь вы можете:\n"
-        f"1. Назначать начальников парка\n"
-        f"2. Назначать водителей\n"
-        f"3. Добавлять технику\n\n"
-        f"Используйте меню директора для управления."
-    )
-
-@dp.message(Command("addeq"))
-async def add_equipment_command(message: types.Message):
-    """Добавляет технику"""
-    user_id = message.from_user.id
-    user_role = await db.get_user_role(user_id)
-    
-    if user_role not in ['director', 'fleetmanager']:
-        await quick_reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = await db.get_user_organization(user_id)
-    
-    if not org_id:
-        await quick_reply(message, "❌ Вы не привязаны к организации.")
-        return
-    
-    parts = message.text.split(maxsplit=3)
-    
-    if len(parts) < 4:
-        await quick_reply(
-            message,
-            "❌ <b>Неверный формат команды</b>\n\n"
-            "<b>Использование:</b>\n"
-            "<code>/addeq Название Модель VIN</code>\n\n"
-            "<b>Пример:</b>\n"
-            "<code>/addeq Экскаватор CAT-320 CAT123456789</code>"
-        )
-        return
-    
-    name = parts[1]
-    model = parts[2]
-    vin = parts[3]
-    
-    try:
-        eq_id = await db.add_equipment(name, model, vin, org_id, user_id)
-        
-        await quick_reply(
-            message,
-            f"✅ <b>Техника добавлена!</b>\n\n"
-            f"<b>Название:</b> {name}\n"
-            f"<b>Модель:</b> {model}\n"
-            f"<b>VIN:</b> {vin}\n"
-            f"<b>ID техники:</b> {eq_id}\n"
-            f"<b>Организация:</b> {org_id}\n\n"
-            f"Техника доступна для начала смены."
-        )
-    except Exception as e:
-        logger.error(f"Ошибка добавления техники: {e}")
-        await quick_reply(
-            message,
-            f"❌ <b>Ошибка добавления техники</b>\n\n"
-            f"Возможные причины:\n"
-            f"1. VIN уже существует\n"
-            f"2. Ошибка базы данных\n"
-            f"3. {str(e)}"
-        )
-
-@dp.message(Command("myrole"))
-async def show_my_role(message: types.Message):
-    """Показывает текущую роль пользователя"""
-    user_id = message.from_user.id
-    user_info = await db.get_user_info(user_id)
-    
-    if not user_info:
-        await quick_reply(message, "❌ Вы не зарегистрированы в системе.")
-        return
-    
-    role_key = user_info['role']
-    role_info = ROLES.get(role_key, {})
-    
-    text = (
         f"👤 <b>Ваш профиль</b>\n\n"
-        f"<b>ID:</b> {user_id}\n"
-        f"<b>Имя:</b> {user_info['full_name']}\n"
-        f"<b>Роль:</b> {role_info.get('name', 'Неизвестно')}\n"
-        f"<b>Уровень доступа:</b> {role_info.get('level', 0)}/100\n"
+        f"<b>ID:</b> {user['telegram_id']}\n"
+        f"<b>Имя:</b> {user['full_name']}\n"
+        f"<b>Роль:</b> {role_name}\n"
+        f"{org_info}"
+        f"<b>Зарегистрирован:</b> {user['created_at'][:10]}"
     )
-    
-    if user_info['organization_id']:
-        org_info = await db.get_organization_info(user_info['organization_id'])
-        if org_info:
-            text += f"<b>Организация:</b> {org_info['name']}\n"
-    
-    if user_info['assigned_by']:
-        assigner_info = await db.get_user_info(user_info['assigned_by'])
-        if assigner_info:
-            text += f"<b>Назначил:</b> {assigner_info['full_name']}\n"
-    
-    text += f"\n<b>Дата регистрации:</b> {user_info['created_at'][:10]}"
-    
-    await quick_reply(message, text)
 
 # ========== ОБРАБОТКА ОШИБОК ==========
 
-@dp.message()
-async def handle_other_messages(message: types.Message):
-    """Обработка всех остальных сообщений"""
-    user_role = await db.get_user_role(message.from_user.id)
-    
-    help_texts = {
-        'botadmin': (
-            "👑 <b>Команды администратора:</b>\n"
-            "/setrole ID РОЛЬ [ORG] - назначить роль\n"
-            "/myrole - показать свою роль\n"
-            "/createorg НАЗВАНИЕ - создать организацию\n"
-            "/addeq НАЗВ МОДЕЛЬ VIN - добавить технику\n\n"
-            "<b>Примеры:</b>\n"
-            "<code>/setrole 123456789 director</code>\n"
-            "<code>/createorg ООО 'СпецТех'</code>"
-        ),
-        'director': (
-            "👨‍💼 <b>Команды директора:</b>\n"
-            "/setrole ID РОЛЬ [ORG] - назначить роль\n"
-            "/myrole - показать свою роль\n"
-            "/createorg НАЗВАНИЕ - создать организацию\n"
-            "/addeq НАЗВ МОДЕЛЬ VIN - добавить технику\n\n"
-            "<b>Примеры:</b>\n"
-            "<code>/setrole 987654321 fleetmanager 1</code>\n"
-            "<code>/addeq Экскаватор CAT-320 CAT123</code>"
-        ),
-        'fleetmanager': (
-            "👷 <b>Команды начальника парка:</b>\n"
-            "/setrole ID driver [ORG] - назначить водителя\n"
-            "/myrole - показать свою роль\n"
-            "/addeq НАЗВ МОДЕЛЬ VIN - добавить технику\n\n"
-            "<b>Примеры:</b>\n"
-            "<code>/setrole 555555555 driver 1</code>\n"
-            "<code>/addeq Бульдозер Komatsu KOM123</code>"
-        ),
-        'driver': (
-            "🚛 <b>Команды водителя:</b>\n"
-            "/myrole - показать свою роль\n"
-            "/start - главное меню\n\n"
-            "Используйте кнопки меню для работы."
-        )
-    }
-    
-    help_text = help_texts.get(user_role, 
-        "🤖 <b>Общие команды:</b>\n"
-        "/start - главное меню\n"
-        "/myrole - показать свою роль\n"
-        "/help - помощь"
-    )
+@dp.message(F.text == "🔙 Главное меню")
+async def back_to_main(message: types.Message):
+    """Возврат в главное меню"""
+    await cmd_start(message)
+
+@dp.message(F.text == "ℹ️ Информация")
+async def show_info(message: types.Message):
+    """Показывает информацию"""
+    user = await db.get_user(message.from_user.id)
+    role_name = ROLES.get(user['role'], {}).get('name', 'Водитель')
     
     await quick_reply(
         message,
-        f"🤔 <b>Используйте меню или команды</b>\n\n{help_text}"
+        f"🤖 <b>ТехКонтроль v2.1</b>\n\n"
+        f"<b>Ваша роль:</b> {role_name}\n"
+        f"<b>Система ролей:</b>\n"
+        f"• Администратор бота\n"
+        f"• Директор компании\n"
+        f"• Начальник парка\n"
+        f"• Водитель\n\n"
+        f"<b>Функции:</b>\n"
+        f"✅ Управление техникой\n"
+        f"✅ Назначение сотрудников\n"
+        f"✅ Контроль смен\n"
+        f"✅ Фото-отчеты\n\n"
+        f"По вопросам обращайтесь к администратору."
     )
 
-# ========== ЗАПУСК БОТА ==========
+@dp.message()
+async def handle_unknown(message: types.Message):
+    """Обработка неизвестных команд"""
+    await quick_reply(
+        message,
+        "🤔 <b>Неизвестная команда</b>\n\n"
+        "Используйте меню или команды:\n"
+        "/start - главное меню\n"
+        "/myrole - моя роль\n"
+        "/help - помощь"
+    )
+
+# ========== ЗАПУСК ==========
 
 async def on_startup():
-    """Запуск бота с созданием администратора"""
+    """Запуск бота"""
     try:
         await db.connect()
         await db.add_test_data()
         
-        # Создаем администратора бота (ЗАМЕНИТЕ ID НА СВОЙ)
-        ADMIN_ID = 1079922982  # <-- ВАШ TELEGRAM ID
+        # Создаем администратора (ЗАМЕНИТЕ ID)
+        ADMIN_ID = 123456789  # <-- ВАШ TELEGRAM ID
         await db.register_user(
             ADMIN_ID,
             "Администратор Бота",
             role='botadmin'
         )
         
-        logger.info("✅ Бот готов к работе!")
-        logger.info(f"👑 Администратор создан: ID {ADMIN_ID}")
+        logger.info("✅ Бот готов!")
+        logger.info(f"👑 Администратор: ID {ADMIN_ID}")
         
     except Exception as e:
         logger.error(f"❌ Ошибка запуска: {e}")
@@ -877,7 +1063,7 @@ async def main():
     await on_startup()
     
     try:
-        logger.info("🚀 Запускаю бота с системой ролей...")
+        logger.info("🚀 Запуск бота...")
         await dp.start_polling(bot, skip_updates=True)
     except Exception as e:
         logger.error(f"❌ Критическая ошибка: {e}")
