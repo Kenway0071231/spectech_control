@@ -94,6 +94,23 @@ class Database:
                 read BOOLEAN DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS action_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL,
+                report_type TEXT NOT NULL,
+                period TEXT NOT NULL,
+                data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (organization_id) REFERENCES organizations (id)
             )'''
         ]
         
@@ -196,8 +213,37 @@ class Database:
 
     # ========== МЕТОДЫ ДЛЯ ОРГАНИЗАЦИЙ ==========
 
+    async def create_organization_for_director(self, director_id, name):
+        """Создает организацию для директора с проверкой"""
+        try:
+            # Проверяем, есть ли у директора уже организация
+            director = await self.get_user(director_id)
+            if director and director.get('organization_id'):
+                # Получаем текущую организацию
+                current_org = await self.get_organization(director['organization_id'])
+                if current_org:
+                    return None, f"У вас уже есть организация: {current_org['name']}"
+            
+            # Создаем организацию
+            cursor = await self.connection.execute(
+                'INSERT INTO organizations (name, director_id) VALUES (?, ?)',
+                (name, director_id)
+            )
+            org_id = cursor.lastrowid
+            
+            # Обновляем пользователя
+            await self.connection.execute(
+                'UPDATE users SET organization_id = ?, role = ? WHERE telegram_id = ?',
+                (org_id, 'director', director_id)
+            )
+            await self.connection.commit()
+            return org_id, None
+        except Exception as e:
+            logger.error(f"Ошибка создания организации для директора: {e}")
+            return None, str(e)
+
     async def create_organization(self, name, director_id):
-        """Создает организацию и возвращает её ID"""
+        """Создает организацию (старый метод для совместимости)"""
         try:
             cursor = await self.connection.execute(
                 'INSERT INTO organizations (name, director_id) VALUES (?, ?)',
@@ -239,6 +285,85 @@ class Database:
         except Exception as e:
             logger.error(f"Ошибка получения всех организаций: {e}")
             return []
+
+    async def get_organization_by_director(self, director_id):
+        """Получает организацию по ID директора"""
+        try:
+            cursor = await self.connection.execute(
+                'SELECT * FROM organizations WHERE director_id = ?',
+                (director_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Ошибка получения организации по директору: {e}")
+            return None
+
+    async def update_organization_name(self, org_id, new_name):
+        """Обновляет название организации"""
+        try:
+            await self.connection.execute(
+                'UPDATE organizations SET name = ? WHERE id = ?',
+                (new_name, org_id)
+            )
+            await self.connection.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления названия организации: {e}")
+            return False
+
+    async def get_organization_stats(self, org_id):
+        """Получает статистику организации"""
+        try:
+            stats = {}
+            
+            # Количество сотрудников по ролям
+            cursor = await self.connection.execute(
+                '''SELECT role, COUNT(*) as count FROM users 
+                   WHERE organization_id = ? 
+                   GROUP BY role''',
+                (org_id,)
+            )
+            roles = await cursor.fetchall()
+            stats['roles'] = {role['role']: role['count'] for role in roles}
+            
+            # Количество техники по статусам
+            cursor = await self.connection.execute(
+                '''SELECT status, COUNT(*) as count FROM equipment 
+                   WHERE organization_id = ? 
+                   GROUP BY status''',
+                (org_id,)
+            )
+            equipment_stats = await cursor.fetchall()
+            stats['equipment'] = {item['status']: item['count'] for item in equipment_stats}
+            
+            # Активные смены
+            cursor = await self.connection.execute(
+                '''SELECT COUNT(*) as count FROM shifts s
+                   JOIN equipment e ON s.equipment_id = e.id
+                   WHERE e.organization_id = ? AND s.status = 'active' ''',
+                (org_id,)
+            )
+            active_shifts = await cursor.fetchone()
+            stats['active_shifts'] = active_shifts['count'] if active_shifts else 0
+            
+            # Количество ТО на этой неделе
+            cursor = await self.connection.execute(
+                '''SELECT COUNT(*) as count FROM maintenance m
+                   JOIN equipment e ON m.equipment_id = e.id
+                   WHERE e.organization_id = ? 
+                   AND m.scheduled_date BETWEEN date('now') AND date('now', '+7 days')
+                   AND m.status = 'scheduled' ''',
+                (org_id,)
+            )
+            weekly_maintenance = await cursor.fetchone()
+            stats['weekly_maintenance'] = weekly_maintenance['count'] if weekly_maintenance else 0
+            
+            return stats
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики организации: {e}")
+            return {}
 
     # ========== МЕТОДЫ ДЛЯ ТЕХНИКИ ==========
 
@@ -681,7 +806,95 @@ class Database:
             logger.error(f"Ошибка отметки уведомления как прочитанного: {e}")
             return False
 
-    # ========== СТАТИСТИЧЕСКИЕ МЕТОДЫ ==========
+    # ========== МЕТОДЫ ДЛЯ ЛОГИРОВАНИЯ ДЕЙСТВИЙ ==========
+
+    async def log_action(self, user_id, action_type, details):
+        """Логирует действия пользователей"""
+        try:
+            await self.connection.execute(
+                'INSERT INTO action_logs (user_id, action_type, details) VALUES (?, ?, ?)',
+                (user_id, action_type, details)
+            )
+            await self.connection.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка логирования действия: {e}")
+            return False
+
+    async def get_recent_actions(self, org_id=None, limit=20):
+        """Получает последние действия"""
+        try:
+            if org_id:
+                cursor = await self.connection.execute(
+                    '''SELECT al.*, u.full_name, u.role 
+                       FROM action_logs al
+                       JOIN users u ON al.user_id = u.telegram_id
+                       WHERE u.organization_id = ?
+                       ORDER BY al.created_at DESC
+                       LIMIT ?''',
+                    (org_id, limit)
+                )
+            else:
+                cursor = await self.connection.execute(
+                    '''SELECT al.*, u.full_name, u.role 
+                       FROM action_logs al
+                       JOIN users u ON al.user_id = u.telegram_id
+                       ORDER BY al.created_at DESC
+                       LIMIT ?''',
+                    (limit,)
+                )
+            
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения последних действий: {e}")
+            return []
+
+    # ========== МЕТОДЫ ДЛЯ СТАТИСТИКИ ==========
+
+    async def get_driver_stats(self, driver_id, days=30):
+        """Получает статистику водителя"""
+        try:
+            stats = {}
+            
+            # Количество смен за период
+            cursor = await self.connection.execute(
+                '''SELECT COUNT(*) as count FROM shifts 
+                   WHERE driver_id = ? 
+                   AND start_time >= datetime('now', ?)''',
+                (driver_id, f'-{days} days')
+            )
+            shifts_count = await cursor.fetchone()
+            stats['shifts_count'] = shifts_count['count'] if shifts_count else 0
+            
+            # Средняя продолжительность смены
+            cursor = await self.connection.execute(
+                '''SELECT AVG(
+                    (julianday(end_time) - julianday(start_time)) * 24
+                   ) as avg_hours FROM shifts 
+                   WHERE driver_id = ? 
+                   AND end_time IS NOT NULL
+                   AND start_time >= datetime('now', ?)''',
+                (driver_id, f'-{days} days')
+            )
+            avg_hours = await cursor.fetchone()
+            stats['avg_shift_hours'] = round(avg_hours['avg_hours'], 1) if avg_hours and avg_hours['avg_hours'] else 0
+            
+            # Количество использованной техники
+            cursor = await self.connection.execute(
+                '''SELECT COUNT(DISTINCT equipment_id) as count FROM shifts 
+                   WHERE driver_id = ? 
+                   AND start_time >= datetime('now', ?)''',
+                (driver_id, f'-{days} days')
+            )
+            equipment_count = await cursor.fetchone()
+            stats['equipment_used'] = equipment_count['count'] if equipment_count else 0
+            
+            return stats
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики водителя: {e}")
+            return {}
 
     async def get_statistics(self):
         """Получает общую статистику"""
@@ -718,61 +931,56 @@ class Database:
             logger.error(f"Ошибка получения статистики: {e}")
             return {}
 
-    async def get_organization_stats(self, org_id):
-        """Получает статистику организации"""
+    # ========== МЕТОДЫ ДЛЯ ОТЧЕТОВ ==========
+
+    async def save_report(self, organization_id, report_type, period, data):
+        """Сохраняет отчет"""
         try:
-            stats = {}
-            
-            # Количество сотрудников
-            cursor = await self.connection.execute(
-                'SELECT COUNT(*) FROM users WHERE organization_id = ?',
-                (org_id,)
+            data_json = json.dumps(data, ensure_ascii=False)
+            await self.connection.execute(
+                'INSERT INTO reports (organization_id, report_type, period, data) VALUES (?, ?, ?, ?)',
+                (organization_id, report_type, period, data_json)
             )
-            stats['users'] = (await cursor.fetchone())[0]
-            
-            # Количество водителей
-            cursor = await self.connection.execute(
-                "SELECT COUNT(*) FROM users WHERE organization_id = ? AND role = 'driver'",
-                (org_id,)
-            )
-            stats['drivers'] = (await cursor.fetchone())[0]
-            
-            # Количество техники
-            cursor = await self.connection.execute(
-                'SELECT COUNT(*) FROM equipment WHERE organization_id = ?',
-                (org_id,)
-            )
-            stats['equipment'] = (await cursor.fetchone())[0]
-            
-            # Активные смены
-            cursor = await self.connection.execute(
-                '''SELECT COUNT(*) FROM shifts s
-                   JOIN equipment e ON s.equipment_id = e.id
-                   WHERE e.organization_id = ? AND s.status = 'active' ''',
-                (org_id,)
-            )
-            stats['active_shifts'] = (await cursor.fetchone())[0]
-            
-            # Предстоящие ТО
-            cursor = await self.connection.execute(
-                '''SELECT COUNT(*) FROM maintenance m
-                   JOIN equipment e ON m.equipment_id = e.id
-                   WHERE e.organization_id = ? AND m.status = 'scheduled' ''',
-                (org_id,)
-            )
-            stats['upcoming_maintenance'] = (await cursor.fetchone())[0]
-            
-            return stats
+            await self.connection.commit()
+            return True
         except Exception as e:
-            logger.error(f"Ошибка получения статистики организации: {e}")
-            return {}
+            logger.error(f"Ошибка сохранения отчета: {e}")
+            return False
+
+    async def get_reports(self, organization_id, limit=10):
+        """Получает отчеты организации"""
+        try:
+            cursor = await self.connection.execute(
+                '''SELECT * FROM reports 
+                   WHERE organization_id = ? 
+                   ORDER BY created_at DESC 
+                   LIMIT ?''',
+                (organization_id, limit)
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            
+            reports = []
+            for row in rows:
+                report = dict(row)
+                try:
+                    report['data'] = json.loads(report['data'])
+                except:
+                    report['data'] = {}
+                reports.append(report)
+            
+            return reports
+        except Exception as e:
+            logger.error(f"Ошибка получения отчетов: {e}")
+            return []
 
     # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
 
     async def reset_database(self):
         """Сбрасывает базу данных (только для тестов!)"""
         try:
-            tables = ['organizations', 'users', 'equipment', 'shifts', 'maintenance', 'daily_checks', 'notifications']
+            tables = ['organizations', 'users', 'equipment', 'shifts', 'maintenance', 
+                     'daily_checks', 'notifications', 'action_logs', 'reports']
             for table in tables:
                 await self.connection.execute(f'DROP TABLE IF EXISTS {table}')
             await self.connection.commit()
