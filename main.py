@@ -1,12 +1,11 @@
 import os
 import logging
 import asyncio
-from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ContentType
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
@@ -28,28 +27,14 @@ bot = Bot(
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Создаем роутеры для разных ролей
-admin_router = Router()
-director_router = Router()
-fleetmanager_router = Router()
-driver_router = Router()
-common_router = Router()
-
-# Включаем все роутеры в диспетчер
-dp.include_router(admin_router)
-dp.include_router(director_router)
-dp.include_router(fleetmanager_router)
-dp.include_router(driver_router)
-dp.include_router(common_router)
-
 # ========== СОСТОЯНИЯ ==========
 class UserStates(StatesGroup):
     waiting_for_username_or_id = State()
     waiting_for_role = State()
-    waiting_for_org_name = State()
     waiting_for_equipment_name = State()
     waiting_for_equipment_model = State()
     waiting_for_equipment_vin = State()
+    waiting_for_org_name = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -66,7 +51,7 @@ async def reply(message, text, **kwargs):
     await send_typing(message.chat.id)
     return await message.answer(text, **kwargs)
 
-def get_main_keyboard(role, org_id=None):
+def get_main_keyboard(role):
     """Генерирует клавиатуру в зависимости от роли"""
     
     keyboards = {
@@ -108,7 +93,14 @@ def get_main_keyboard(role, org_id=None):
         input_field_placeholder="Выберите действие..."
     )
 
-# ========== КОМАНДА СТАРТ (ОБЩАЯ) ==========
+def get_cancel_keyboard():
+    """Клавиатура с кнопкой отмены"""
+    return types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True
+    )
+
+# ========== КОМАНДА СТАРТ ==========
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -118,9 +110,10 @@ async def cmd_start(message: types.Message):
     # Регистрируем, если пользователя нет
     if not user:
         await db.register_user(
-            message.from_user.id,
-            f"{message.from_user.first_name} {message.from_user.last_name or ''}",
-            message.from_user.username
+            telegram_id=message.from_user.id,
+            full_name=f"{message.from_user.first_name} {message.from_user.last_name or ''}".strip(),
+            username=message.from_user.username,
+            role='driver'
         )
         user = await db.get_user(message.from_user.id)
     
@@ -134,16 +127,17 @@ async def cmd_start(message: types.Message):
     
     await reply(
         message,
-        f"{role_names.get(role, '👤 Пользователь')}\n\n"
+        f"🤖 <b>ТехКонтроль Бот</b>\n\n"
+        f"<b>Роль:</b> {role_names.get(role, '👤 Пользователь')}\n"
         f"<b>ID:</b> {message.from_user.id}\n"
         f"<b>Имя:</b> {message.from_user.full_name}\n\n"
         f"Выберите действие из меню:",
-        reply_markup=get_main_keyboard(role, user.get('organization_id'))
+        reply_markup=get_main_keyboard(role)
     )
 
 # ========== ОБРАБОТЧИКИ АДМИНИСТРАТОРА ==========
 
-@admin_router.message(F.text == "👑 Админ-панель")
+@dp.message(F.text == "👑 Админ-панель")
 async def admin_panel(message: types.Message):
     """Панель администратора"""
     user = await db.get_user(message.from_user.id)
@@ -159,14 +153,14 @@ async def admin_panel(message: types.Message):
         "👑 <b>Панель администратора</b>\n\n"
         f"<b>Организаций:</b> {len(organizations)}\n"
         f"<b>Пользователей:</b> {len(users)}\n\n"
-        "<b>Управление:</b>\n"
-        "• Создание организаций\n"
-        "• Назначение директоров\n"
-        "• Просмотр статистики\n"
-        "• Управление пользователями"
+        "<b>Доступные действия:</b>\n"
+        "• Просмотр всех организаций\n"
+        "• Просмотр всех пользователей\n"
+        "• Назначение ролей\n"
+        "• Просмотр статистики"
     )
 
-@admin_router.message(F.text == "🏢 Все организации")
+@dp.message(F.text == "🏢 Все организации")
 async def show_all_organizations(message: types.Message):
     """Показывает все организации"""
     user = await db.get_user(message.from_user.id)
@@ -177,19 +171,20 @@ async def show_all_organizations(message: types.Message):
     organizations = await db.get_all_organizations()
     
     if not organizations:
-        await reply(message, "🏢 <b>Организаций пока нет</b>")
+        await reply(message, "🏢 <b>Организаций пока нет</b>\n\nСоздайте первую организацию с помощью команды /createorg")
         return
     
     text = "🏢 <b>Все организации</b>\n\n"
     
     for org in organizations:
-        text += f"<b>{org['name']}</b>\n"
-        text += f"ID: {org['id']} | Директор: {org['director_id']}\n"
-        text += f"Создана: {org['created_at'][:10]}\n\n"
+        text += f"<b>• {org['name']}</b>\n"
+        text += f"  ID: {org['id']}\n"
+        text += f"  Директор ID: {org['director_id']}\n"
+        text += f"  Создана: {org['created_at'][:10]}\n\n"
     
     await reply(message, text)
 
-@admin_router.message(F.text == "👥 Все пользователи")
+@dp.message(F.text == "👥 Все пользователи")
 async def show_all_users(message: types.Message):
     """Показывает всех пользователей"""
     user = await db.get_user(message.from_user.id)
@@ -225,7 +220,7 @@ async def show_all_users(message: types.Message):
     
     await reply(message, text)
 
-@admin_router.message(F.text == "📊 Статистика")
+@dp.message(F.text == "📊 Статистика")
 async def show_statistics(message: types.Message):
     """Показывает статистику"""
     user = await db.get_user(message.from_user.id)
@@ -257,12 +252,14 @@ async def show_statistics(message: types.Message):
     
     await reply(message, text)
 
-@admin_router.message(F.text == "➕ Назначить роль")
+@dp.message(F.text == "➕ Назначить роль")
 async def assign_role_start(message: types.Message, state: FSMContext):
     """Начинает назначение роли"""
     user = await db.get_user(message.from_user.id)
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
+    
+    # Проверяем права
+    if user['role'] == 'driver':
+        await reply(message, "⛔ У водителей нет прав назначать роли!")
         return
     
     await reply(
@@ -273,16 +270,13 @@ async def assign_role_start(message: types.Message, state: FSMContext):
         "• 123456789 (ID)\n"
         "• @username\n"
         "• username (без @)",
-        reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
-            resize_keyboard=True
-        )
+        reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_username_or_id)
 
 # ========== ОБРАБОТЧИКИ ДИРЕКТОРА ==========
 
-@director_router.message(F.text == "👨‍💼 Моя организация")
+@dp.message(F.text == "👨‍💼 Моя организация")
 async def director_org(message: types.Message):
     """Организация директора"""
     user = await db.get_user(message.from_user.id)
@@ -310,20 +304,21 @@ async def director_org(message: types.Message):
     
     text = (
         f"🏢 <b>Организация: {org['name']}</b>\n\n"
-        f"<b>ID:</b> {org_id}\n"
+        f"<b>ID организации:</b> {org_id}\n"
         f"<b>Директор:</b> {user['full_name']}\n"
         f"<b>Создана:</b> {org['created_at'][:10]}\n\n"
         f"<b>Сотрудники:</b> {len(users)} чел.\n"
         f"<b>Техника:</b> {len(equipment)} ед.\n\n"
-        "<b>Управление:</b>\n"
-        "• Добавить технику\n"
-        "• Назначить сотрудников\n"
-        "• Просмотреть отчеты"
+        "<b>Доступные действия:</b>\n"
+        "• Просмотр автопарка\n"
+        "• Просмотр сотрудников\n"
+        "• Добавление техники\n"
+        "• Назначение ролей"
     )
     
     await reply(message, text)
 
-@director_router.message(F.text == "🚜 Автопарк")
+@dp.message(F.text == "🚜 Автопарк")
 async def show_equipment(message: types.Message):
     """Показывает технику организации"""
     user = await db.get_user(message.from_user.id)
@@ -343,14 +338,15 @@ async def show_equipment(message: types.Message):
             message,
             "🚜 <b>Автопарк</b>\n\n"
             "Техники пока нет.\n"
-            "Добавьте технику через меню."
+            "Добавьте технику через меню '➕ Добавить технику'."
         )
         return
     
     text = f"🚜 <b>Автопарк ({len(equipment)} ед.)</b>\n\n"
     
-    for eq in equipment[:10]:
-        text += f"• <b>{eq['name']}</b> ({eq['model']})\n"
+    for eq in equipment[:10]:  # Показываем первые 10 единиц
+        text += f"<b>• {eq['name']}</b>\n"
+        text += f"  Модель: {eq['model']}\n"
         text += f"  VIN: {eq['vin']}\n"
         text += f"  Статус: {eq['status']}\n\n"
     
@@ -359,7 +355,7 @@ async def show_equipment(message: types.Message):
     
     await reply(message, text)
 
-@director_router.message(F.text == "👥 Сотрудники")
+@dp.message(F.text == "👥 Сотрудники")
 async def show_employees(message: types.Message):
     """Показывает сотрудников организации"""
     user = await db.get_user(message.from_user.id)
@@ -379,7 +375,7 @@ async def show_employees(message: types.Message):
             message,
             "👥 <b>Сотрудники</b>\n\n"
             "Сотрудников пока нет.\n"
-            "Назначьте сотрудников через меню."
+            "Назначьте сотрудников через меню '➕ Назначить роль'."
         )
         return
     
@@ -399,7 +395,7 @@ async def show_employees(message: types.Message):
     
     await reply(message, text)
 
-@director_router.message(F.text == "➕ Добавить технику")
+@dp.message(F.text == "➕ Добавить технику")
 async def add_equipment_start(message: types.Message, state: FSMContext):
     """Начинает добавление техники"""
     user = await db.get_user(message.from_user.id)
@@ -418,16 +414,32 @@ async def add_equipment_start(message: types.Message, state: FSMContext):
         message,
         "🚜 <b>Добавление техники</b>\n\n"
         "Введите название техники:",
-        reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
-            resize_keyboard=True
-        )
+        reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_equipment_name)
 
+@dp.message(F.text == "📊 Отчеты")
+async def show_reports(message: types.Message):
+    """Показывает отчеты для директора"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'director':
+        await reply(message, "⛔ Доступ только для директора!")
+        return
+    
+    await reply(
+        message,
+        "📊 <b>Отчеты</b>\n\n"
+        "Эта функция в разработке.\n"
+        "Скоро здесь будут доступны:\n"
+        "• Ежедневные отчеты\n"
+        "• Финансовые отчеты\n"
+        "• Отчеты по технике\n"
+        "• Статистика работы водителей"
+    )
+
 # ========== ОБРАБОТЧИКИ НАЧАЛЬНИКА ПАРКА ==========
 
-@fleetmanager_router.message(F.text == "👷 Управление парком")
+@dp.message(F.text == "👷 Управление парком")
 async def fleetmanager_panel(message: types.Message):
     """Панель начальника парка"""
     user = await db.get_user(message.from_user.id)
@@ -459,9 +471,65 @@ async def fleetmanager_panel(message: types.Message):
         "• Назначение водителей"
     )
 
+@dp.message(F.text == "🚜 Техника")
+async def show_equipment_fleetmanager(message: types.Message):
+    """Показывает технику для начальника парка"""
+    await show_equipment(message)  # Используем тот же обработчик
+
+@dp.message(F.text == "👥 Водители")
+async def show_drivers(message: types.Message):
+    """Показывает водителей для начальника парка"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'fleetmanager':
+        await reply(message, "⛔ Доступ только для начальника парка!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    users = await db.get_users_by_organization(org_id)
+    drivers = [u for u in users if u['role'] == 'driver']
+    
+    if not drivers:
+        await reply(
+            message,
+            "👥 <b>Водители</b>\n\n"
+            "Водителей пока нет.\n"
+            "Назначьте водителей через меню '➕ Назначить водителя'."
+        )
+        return
+    
+    text = f"👥 <b>Водители ({len(drivers)} чел.)</b>\n\n"
+    
+    for d in drivers:
+        text += f"🚛 <b>{d['full_name']}</b>\n"
+        if d['username']:
+            text += f"@{d['username']} | "
+        text += f"ID: {d['telegram_id']}\n\n"
+    
+    await reply(message, text)
+
+@dp.message(F.text == "➕ Назначить водителя")
+async def assign_driver_start(message: types.Message, state: FSMContext):
+    """Начинает назначение водителя"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] != 'fleetmanager':
+        await reply(message, "⛔ Доступ только для начальника парка!")
+        return
+    
+    await reply(
+        message,
+        "👤 <b>Назначение водителя</b>\n\n"
+        "Введите Telegram ID или @username пользователя:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_username_or_id)
+
 # ========== ОБРАБОТЧИКИ ВОДИТЕЛЯ ==========
 
-@driver_router.message(F.text == "🚛 Начать смену")
+@dp.message(F.text == "🚛 Начать смену")
 async def start_shift(message: types.Message):
     """Начинает смену водителя"""
     user = await db.get_user(message.from_user.id)
@@ -485,7 +553,7 @@ async def start_shift(message: types.Message):
         "А пока можете просмотреть свои смены."
     )
 
-@driver_router.message(F.text == "📋 Мои смены")
+@dp.message(F.text == "📋 Мои смены")
 async def my_shifts(message: types.Message):
     """Показывает смены водителя"""
     await reply(
@@ -499,7 +567,7 @@ async def my_shifts(message: types.Message):
         "А пока можете начать новую смену!"
     )
 
-@driver_router.message(F.text == "ℹ️ Информация")
+@dp.message(F.text == "ℹ️ Информация")
 async def info(message: types.Message):
     """Показывает информацию"""
     user = await db.get_user(message.from_user.id)
@@ -510,18 +578,25 @@ async def info(message: types.Message):
         'driver': '🚛 Водитель'
     }
     
+    org_info = ""
+    if user.get('organization_id'):
+        org = await db.get_organization(user['organization_id'])
+        if org:
+            org_info = f"<b>Организация:</b> {org['name']}\n"
+    
     await reply(
         message,
-        f"🤖 <b>ТехКонтроль v3.0</b>\n\n"
+        f"🤖 <b>ТехКонтроль v1.0</b>\n\n"
         f"<b>Ваша роль:</b> {role_names.get(user['role'], '👤 Пользователь')}\n"
+        f"{org_info}"
         f"<b>ID:</b> {message.from_user.id}\n\n"
-        "<b>Система ролей:</b>\n"
-        "• Администратор - полный доступ\n"
-        "• Директор - управление организацией\n"
-        "• Начальник парка - управление техникой\n"
-        "• Водитель - работа со сменами\n\n"
+        "<b>Назначение бота:</b>\n"
+        "• Учет и контроль спецтехники\n"
+        "• Управление водителями\n"
+        "• Отслеживание ТО и ремонтов\n"
+        "• Ежедневное обслуживание\n\n"
         "<b>По вопросам:</b>\n"
-        "Обращайтесь к администратору."
+        "Обращайтесь к администратору вашей организации."
     )
 
 # ========== ОБРАБОТЧИКИ СОСТОЯНИЙ ==========
@@ -531,7 +606,8 @@ async def process_username_or_id(message: types.Message, state: FSMContext):
     """Обрабатывает ввод username или ID"""
     if message.text == "❌ Отмена":
         await state.clear()
-        await cmd_start(message)
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role']))
         return
     
     identifier = message.text.strip()
@@ -555,6 +631,8 @@ async def process_username_or_id(message: types.Message, state: FSMContext):
     if not roles:
         await reply(message, "❌ У вас нет прав для назначения ролей!")
         await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role']))
         return
     
     keyboard = []
@@ -575,7 +653,8 @@ async def process_role_selection(message: types.Message, state: FSMContext):
     """Обрабатывает выбор роли"""
     if message.text == "❌ Отмена":
         await state.clear()
-        await cmd_start(message)
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role']))
         return
     
     role_map = {
@@ -622,7 +701,24 @@ async def process_role_selection(message: types.Message, state: FSMContext):
     
     # Получаем организацию назначающего (если нужно)
     assigner = await db.get_user(message.from_user.id)
+    assigner_role = assigner['role']
     org_id = assigner.get('organization_id')
+    
+    # Проверяем права на назначение этой роли
+    can_assign = {
+        'botadmin': ['botadmin', 'director', 'fleetmanager', 'driver'],
+        'director': ['fleetmanager', 'driver'],
+        'fleetmanager': ['driver']
+    }
+    
+    if selected_role not in can_assign.get(assigner_role, []):
+        await reply(
+            message,
+            f"⛔ У вас нет прав назначать роль '{selected_role}'!\n"
+            f"Ваша роль: {assigner_role}"
+        )
+        await state.clear()
+        return
     
     # Назначаем роль
     success = await db.update_user_role(user_id, selected_role, org_id)
@@ -666,7 +762,8 @@ async def process_role_selection(message: types.Message, state: FSMContext):
 async def process_equipment_name(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await state.clear()
-        await cmd_start(message)
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role']))
         return
     
     await state.update_data(name=message.text)
@@ -677,7 +774,8 @@ async def process_equipment_name(message: types.Message, state: FSMContext):
 async def process_equipment_model(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await state.clear()
-        await cmd_start(message)
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role']))
         return
     
     await state.update_data(model=message.text)
@@ -688,7 +786,8 @@ async def process_equipment_model(message: types.Message, state: FSMContext):
 async def process_equipment_vin(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await state.clear()
-        await cmd_start(message)
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role']))
         return
     
     data = await state.get_data()
@@ -717,12 +816,13 @@ async def process_equipment_vin(message: types.Message, state: FSMContext):
         )
     
     await state.clear()
-    await cmd_start(message)
+    user = await db.get_user(message.from_user.id)
+    await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role']))
 
 # ========== КОМАНДЫ ==========
 
 @dp.message(Command("createorg"))
-async def create_organization_cmd(message: types.Message):
+async def create_organization_cmd(message: types.Message, state: FSMContext):
     """Создает организацию для директора"""
     user = await db.get_user(message.from_user.id)
     
@@ -914,15 +1014,38 @@ async def setrole_cmd(message: types.Message):
     else:
         await reply(message, "❌ Ошибка при назначении роли!")
 
+@dp.message(Command("help"))
+async def help_cmd(message: types.Message):
+    """Показывает справку"""
+    await reply(
+        message,
+        "🤖 <b>ТехКонтроль Бот - Справка</b>\n\n"
+        "<b>Основные команды:</b>\n"
+        "/start - Главное меню\n"
+        "/myrole - Показать мою роль\n"
+        "/setrole - Назначить роль (администраторы)\n"
+        "/createorg - Создать организацию (директора)\n"
+        "/help - Эта справка\n\n"
+        "<b>Система ролей:</b>\n"
+        "• Администратор - полный доступ\n"
+        "• Директор - управление организацией\n"
+        "• Начальник парка - управление техникой\n"
+        "• Водитель - работа со сменами\n\n"
+        "<b>Доступные функции:</b>\n"
+        "• Учет техники\n"
+        "• Назначение ролей\n"
+        "• Просмотр статистики\n"
+        "• Управление организациями"
+    )
+
 # ========== ОБРАБОТКА НЕИЗВЕСТНЫХ КОМАНД ==========
 
 @dp.message()
-async def handle_unknown(message: types.Message):
+async def handle_unknown(message: types.Message, state: FSMContext):
     """Обрабатывает неизвестные команды"""
-    user = await db.get_user(message.from_user.id)
+    current_state = await state.get_state()
     
     # Если пользователь в состоянии - игнорируем
-    current_state = await dp.storage.get_state(chat=message.chat.id, user=message.from_user.id)
     if current_state:
         return
     
@@ -935,11 +1058,12 @@ async def handle_unknown(message: types.Message):
             "/start - главное меню\n"
             "/myrole - моя роль\n"
             "/setrole - назначить роль\n"
-            "/createorg - создать организацию"
+            "/createorg - создать организацию\n"
+            "/help - справка"
         )
     elif message.text:
         # Если это текстовая команда, но не обработана
-        await reply(message, "❌ Эта команда временно недоступна. Используйте меню.")
+        await reply(message, "❌ Эта команда временно недоступна. Используйте меню или /help.")
 
 # ========== ЗАПУСК БОТА ==========
 
@@ -948,11 +1072,12 @@ async def on_startup():
     try:
         await db.connect()
         
-        # Создаем администратора (ЗАМЕНИТЕ ID НА СВОЙ!)
-        ADMIN_ID = 1079922982  # <-- ВАШ TELEGRAM ID
+        # Создаем администратора (ВАЖНО: ЗАМЕНИТЕ ID НА СВОЙ!)
+        ADMIN_ID = 1079922982  # <-- ЗАМЕНИТЕ ЭТО НА ВАШ TELEGRAM ID!
         await db.register_user(
-            ADMIN_ID,
-            "Администратор Системы",
+            telegram_id=ADMIN_ID,
+            full_name="Администратор Системы",
+            username="admin",
             role='botadmin'
         )
         
