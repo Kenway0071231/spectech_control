@@ -3,22 +3,31 @@ import logging
 import os
 import json
 from datetime import datetime, timedelta
+import asyncio
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self, db_path=None):
-        self.db_path = db_path or ':memory:' if os.getenv('BOTHOST') else 'tech_control.db'
+        self.db_path = db_path or 'tech_control.db'
         print(f"📦 База данных: {self.db_path}")
+        self.connection = None
 
     async def connect(self):
-        self.connection = await aiosqlite.connect(self.db_path)
-        self.connection.row_factory = aiosqlite.Row
-        await self.create_tables()
-        logger.info("✅ База данных подключена")
+        """Подключается к базе данных"""
+        try:
+            self.connection = await aiosqlite.connect(self.db_path)
+            self.connection.row_factory = aiosqlite.Row
+            await self.create_tables()
+            logger.info("✅ База данных подключена и таблицы созданы")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к базе данных: {e}")
+            return False
 
     async def create_tables(self):
+        """Создает все необходимые таблицы"""
         tables = [
             '''CREATE TABLE IF NOT EXISTS organizations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,13 +123,14 @@ class Database:
             )'''
         ]
         
-        for table_sql in tables:
-            try:
+        try:
+            for table_sql in tables:
                 await self.connection.execute(table_sql)
-            except Exception as e:
-                logger.error(f"Ошибка создания таблицы: {e}")
-        
-        await self.connection.commit()
+            await self.connection.commit()
+            logger.info("✅ Все таблицы созданы успешно")
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания таблиц: {e}")
+            raise
 
     # ========== МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ==========
 
@@ -134,9 +144,10 @@ class Database:
                 (telegram_id, full_name, username, role, organization_id)
             )
             await self.connection.commit()
+            logger.info(f"✅ Пользователь зарегистрирован: {full_name} ({telegram_id})")
             return True
         except Exception as e:
-            logger.error(f"Ошибка регистрации пользователя: {e}")
+            logger.error(f"❌ Ошибка регистрации пользователя {telegram_id}: {e}")
             return False
 
     async def get_user(self, telegram_id):
@@ -150,7 +161,7 @@ class Database:
             await cursor.close()
             return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Ошибка получения пользователя: {e}")
+            logger.error(f"❌ Ошибка получения пользователя {telegram_id}: {e}")
             return None
 
     async def get_all_users(self):
@@ -161,7 +172,7 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения всех пользователей: {e}")
+            logger.error(f"❌ Ошибка получения всех пользователей: {e}")
             return []
 
     async def get_users_by_organization(self, org_id):
@@ -175,21 +186,7 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения пользователей организации: {e}")
-            return []
-
-    async def get_users_by_role(self, role):
-        """Получает пользователей по роли"""
-        try:
-            cursor = await self.connection.execute(
-                'SELECT * FROM users WHERE role = ?',
-                (role,)
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Ошибка получения пользователей по роли: {e}")
+            logger.error(f"❌ Ошибка получения пользователей организации {org_id}: {e}")
             return []
 
     async def update_user_role(self, telegram_id, new_role, organization_id=None):
@@ -206,9 +203,10 @@ class Database:
                     (new_role, telegram_id)
                 )
             await self.connection.commit()
+            logger.info(f"✅ Роль обновлена для {telegram_id}: {new_role}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка обновления роли пользователя: {e}")
+            logger.error(f"❌ Ошибка обновления роли пользователя {telegram_id}: {e}")
             return False
 
     # ========== МЕТОДЫ ДЛЯ ОРГАНИЗАЦИЙ ==========
@@ -219,7 +217,6 @@ class Database:
             # Проверяем, есть ли у директора уже организация
             director = await self.get_user(director_id)
             if director and director.get('organization_id'):
-                # Получаем текущую организацию
                 current_org = await self.get_organization(director['organization_id'])
                 if current_org:
                     return None, f"У вас уже есть организация: {current_org['name']}"
@@ -232,34 +229,14 @@ class Database:
             org_id = cursor.lastrowid
             
             # Обновляем пользователя
-            await self.connection.execute(
-                'UPDATE users SET organization_id = ?, role = ? WHERE telegram_id = ?',
-                (org_id, 'director', director_id)
-            )
+            await self.update_user_role(director_id, 'director', org_id)
             await self.connection.commit()
+            
+            logger.info(f"✅ Организация создана: {name} (ID: {org_id})")
             return org_id, None
         except Exception as e:
-            logger.error(f"Ошибка создания организации для директора: {e}")
+            logger.error(f"❌ Ошибка создания организации: {e}")
             return None, str(e)
-
-    async def create_organization(self, name, director_id):
-        """Создает организацию (старый метод для совместимости)"""
-        try:
-            cursor = await self.connection.execute(
-                'INSERT INTO organizations (name, director_id) VALUES (?, ?)',
-                (name, director_id)
-            )
-            org_id = cursor.lastrowid
-            
-            await self.connection.execute(
-                'UPDATE users SET organization_id = ? WHERE telegram_id = ?',
-                (org_id, director_id)
-            )
-            await self.connection.commit()
-            return org_id
-        except Exception as e:
-            logger.error(f"Ошибка создания организации: {e}")
-            return None
 
     async def get_organization(self, org_id):
         """Получает организацию по ID"""
@@ -272,7 +249,7 @@ class Database:
             await cursor.close()
             return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Ошибка получения организации: {e}")
+            logger.error(f"❌ Ошибка получения организации {org_id}: {e}")
             return None
 
     async def get_all_organizations(self):
@@ -283,22 +260,8 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения всех организаций: {e}")
+            logger.error(f"❌ Ошибка получения всех организаций: {e}")
             return []
-
-    async def get_organization_by_director(self, director_id):
-        """Получает организацию по ID директора"""
-        try:
-            cursor = await self.connection.execute(
-                'SELECT * FROM organizations WHERE director_id = ?',
-                (director_id,)
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Ошибка получения организации по директору: {e}")
-            return None
 
     async def update_organization_name(self, org_id, new_name):
         """Обновляет название организации"""
@@ -308,9 +271,10 @@ class Database:
                 (new_name, org_id)
             )
             await self.connection.commit()
+            logger.info(f"✅ Название организации {org_id} обновлено: {new_name}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка обновления названия организации: {e}")
+            logger.error(f"❌ Ошибка обновления названия организации {org_id}: {e}")
             return False
 
     async def get_organization_stats(self, org_id):
@@ -362,7 +326,7 @@ class Database:
             
             return stats
         except Exception as e:
-            logger.error(f"Ошибка получения статистики организации: {e}")
+            logger.error(f"❌ Ошибка получения статистики организации {org_id}: {e}")
             return {}
 
     # ========== МЕТОДЫ ДЛЯ ТЕХНИКИ ==========
@@ -375,9 +339,11 @@ class Database:
                 (name, model, vin, organization_id)
             )
             await self.connection.commit()
-            return cursor.lastrowid
+            equipment_id = cursor.lastrowid
+            logger.info(f"✅ Техника добавлена: {name} (ID: {equipment_id})")
+            return equipment_id
         except Exception as e:
-            logger.error(f"Ошибка добавления техники: {e}")
+            logger.error(f"❌ Ошибка добавления техники {name}: {e}")
             return None
 
     async def get_organization_equipment(self, org_id):
@@ -391,13 +357,12 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения техники организации: {e}")
+            logger.error(f"❌ Ошибка получения техники организации {org_id}: {e}")
             return []
 
     async def get_equipment_by_driver(self, driver_id):
         """Получает технику доступную водителю"""
         try:
-            # Сначала получаем организацию водителя
             user = await self.get_user(driver_id)
             if not user or not user.get('organization_id'):
                 return []
@@ -413,35 +378,8 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения техники водителя: {e}")
+            logger.error(f"❌ Ошибка получения техники для водителя {driver_id}: {e}")
             return []
-
-    async def get_equipment_by_id(self, equipment_id):
-        """Получает технику по ID"""
-        try:
-            cursor = await self.connection.execute(
-                'SELECT * FROM equipment WHERE id = ?',
-                (equipment_id,)
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Ошибка получения техники по ID: {e}")
-            return None
-
-    async def update_equipment_maintenance_date(self, equipment_id, next_date):
-        """Обновляет дату следующего ТО для техники"""
-        try:
-            await self.connection.execute(
-                'UPDATE equipment SET next_maintenance = ? WHERE id = ?',
-                (next_date, equipment_id)
-            )
-            await self.connection.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка обновления даты ТО техники: {e}")
-            return False
 
     # ========== МЕТОДЫ ДЛЯ СМЕН ==========
 
@@ -455,9 +393,10 @@ class Database:
             )
             shift_id = cursor.lastrowid
             await self.connection.commit()
+            logger.info(f"✅ Смена начата: ID {shift_id}, водитель {driver_id}")
             return shift_id
         except Exception as e:
-            logger.error(f"Ошибка начала смены: {e}")
+            logger.error(f"❌ Ошибка начала смены для водителя {driver_id}: {e}")
             return None
 
     async def get_active_shift(self, driver_id):
@@ -475,25 +414,7 @@ class Database:
             await cursor.close()
             return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Ошибка получения активной смены: {e}")
-            return None
-
-    async def get_shift_by_id(self, shift_id):
-        """Получает смену по ID"""
-        try:
-            cursor = await self.connection.execute(
-                '''SELECT s.*, e.name as equipment_name, e.model, u.full_name as driver_name
-                   FROM shifts s
-                   JOIN equipment e ON s.equipment_id = e.id
-                   JOIN users u ON s.driver_id = u.telegram_id
-                   WHERE s.id = ?''',
-                (shift_id,)
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Ошибка получения смены по ID: {e}")
+            logger.error(f"❌ Ошибка получения активной смены водителя {driver_id}: {e}")
             return None
 
     async def update_shift_photo(self, shift_id, photo_file_id):
@@ -504,9 +425,10 @@ class Database:
                 (photo_file_id, shift_id)
             )
             await self.connection.commit()
+            logger.info(f"✅ Фото обновлено для смены {shift_id}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка обновления фото смены: {e}")
+            logger.error(f"❌ Ошибка обновления фото для смены {shift_id}: {e}")
             return False
 
     async def complete_shift(self, shift_id, notes=None):
@@ -521,9 +443,10 @@ class Database:
                 (notes, shift_id)
             )
             await self.connection.commit()
+            logger.info(f"✅ Смена завершена: ID {shift_id}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка завершения смены: {e}")
+            logger.error(f"❌ Ошибка завершения смены {shift_id}: {e}")
             return False
 
     async def approve_inspection(self, shift_id, approved_by):
@@ -537,9 +460,10 @@ class Database:
                 (approved_by, shift_id)
             )
             await self.connection.commit()
+            logger.info(f"✅ Осмотр подтверждён для смены {shift_id}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка подтверждения осмотра: {e}")
+            logger.error(f"❌ Ошибка подтверждения осмотра смены {shift_id}: {e}")
             return False
 
     async def get_shifts_by_driver(self, driver_id, limit=10):
@@ -558,7 +482,7 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения смен водителя: {e}")
+            logger.error(f"❌ Ошибка получения смен водителя {driver_id}: {e}")
             return []
 
     async def get_pending_inspections(self, organization_id):
@@ -580,10 +504,10 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения ожидающих проверок: {e}")
+            logger.error(f"❌ Ошибка получения ожидающих проверок организации {organization_id}: {e}")
             return []
 
-    # ========== МЕТОДЫ ДЛЯ ТО (ТЕХНИЧЕСКОГО ОБСЛУЖИВАНИЯ) ==========
+    # ========== МЕТОДЫ ДЛЯ ТО ==========
 
     async def add_maintenance(self, equipment_id, type, scheduled_date, description=None):
         """Добавляет запись о ТО"""
@@ -595,15 +519,15 @@ class Database:
             )
             maintenance_id = cursor.lastrowid
             
-            # Обновляем дату следующего ТО в технике
             await self.connection.execute(
                 'UPDATE equipment SET next_maintenance = ? WHERE id = ?',
                 (scheduled_date, equipment_id)
             )
             await self.connection.commit()
+            logger.info(f"✅ ТО добавлено: ID {maintenance_id}, оборудование {equipment_id}")
             return maintenance_id
         except Exception as e:
-            logger.error(f"Ошибка добавления ТО: {e}")
+            logger.error(f"❌ Ошибка добавления ТО для оборудования {equipment_id}: {e}")
             return None
 
     async def get_upcoming_maintenance(self, days=7):
@@ -624,71 +548,8 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения предстоящих ТО: {e}")
+            logger.error(f"❌ Ошибка получения предстоящих ТО: {e}")
             return []
-
-    async def get_maintenance_by_equipment(self, equipment_id):
-        """Получает ТО для конкретной техники"""
-        try:
-            cursor = await self.connection.execute(
-                '''SELECT * FROM maintenance 
-                   WHERE equipment_id = ? 
-                   ORDER BY scheduled_date DESC''',
-                (equipment_id,)
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Ошибка получения ТО техники: {e}")
-            return []
-
-    async def get_maintenance_by_id(self, maintenance_id):
-        """Получает ТО по ID"""
-        try:
-            cursor = await self.connection.execute(
-                '''SELECT m.*, e.name as equipment_name, e.model, e.vin
-                   FROM maintenance m
-                   JOIN equipment e ON m.equipment_id = e.id
-                   WHERE m.id = ?''',
-                (maintenance_id,)
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Ошибка получения ТО по ID: {e}")
-            return None
-
-    async def mark_maintenance_notified(self, maintenance_id):
-        """Отмечает что уведомление о ТО отправлено"""
-        try:
-            await self.connection.execute(
-                'UPDATE maintenance SET notified = 1 WHERE id = ?',
-                (maintenance_id,)
-            )
-            await self.connection.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка отметки уведомления ТО: {e}")
-            return False
-
-    async def complete_maintenance(self, maintenance_id, cost=None):
-        """Отмечает ТО как выполненное"""
-        try:
-            await self.connection.execute(
-                '''UPDATE maintenance 
-                   SET status = 'completed', 
-                       completed_date = CURRENT_DATE,
-                       cost = ?
-                   WHERE id = ?''',
-                (cost, maintenance_id)
-            )
-            await self.connection.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка завершения ТО: {e}")
-            return False
 
     async def get_active_maintenance(self, organization_id=None):
         """Получает активные (не выполненные) ТО"""
@@ -709,21 +570,20 @@ class Database:
                        FROM maintenance m
                        JOIN equipment e ON m.equipment_id = e.id
                        WHERE m.status = 'scheduled'
-                       ORDER BY m.scheduled_date''',
+                       ORDER BY m.scheduled_date'''
                 )
             
             rows = await cursor.fetchall()
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения активных ТО: {e}")
+            logger.error(f"❌ Ошибка получения активных ТО: {e}")
             return []
 
     # ========== МЕТОДЫ ДЛЯ ЕЖЕДНЕВНЫХ ПРОВЕРОК ==========
 
     async def get_daily_checks(self):
         """Получает список ежедневных проверок"""
-        # Стандартный список проверок
         checks = [
             {"type": "engine", "item": "Уровень масла", "check": "Нормальный"},
             {"type": "engine", "item": "Уровень охлаждающей жидкости", "check": "Нормальный"},
@@ -747,66 +607,10 @@ class Database:
             await self.connection.commit()
             return True
         except Exception as e:
-            logger.error(f"Ошибка добавления ежедневной проверки: {e}")
+            logger.error(f"❌ Ошибка добавления ежедневной проверки для смены {shift_id}: {e}")
             return False
 
-    async def get_checks_by_shift(self, shift_id):
-        """Получает проверки для смены"""
-        try:
-            cursor = await self.connection.execute(
-                'SELECT * FROM daily_checks WHERE shift_id = ? ORDER BY created_at',
-                (shift_id,)
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Ошибка получения проверок смены: {e}")
-            return []
-
-    # ========== МЕТОДЫ ДЛЯ УВЕДОМЛЕНИЙ ==========
-
-    async def add_notification(self, user_id, message):
-        """Добавляет уведомление"""
-        try:
-            await self.connection.execute(
-                'INSERT INTO notifications (user_id, message) VALUES (?, ?)',
-                (user_id, message)
-            )
-            await self.connection.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка добавления уведомления: {e}")
-            return False
-
-    async def get_unread_notifications(self, user_id):
-        """Получает непрочитанные уведомления пользователя"""
-        try:
-            cursor = await self.connection.execute(
-                'SELECT * FROM notifications WHERE user_id = ? AND read = 0 ORDER BY created_at DESC',
-                (user_id,)
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Ошибка получения непрочитанных уведомлений: {e}")
-            return []
-
-    async def mark_notification_read(self, notification_id):
-        """Отмечает уведомление как прочитанное"""
-        try:
-            await self.connection.execute(
-                'UPDATE notifications SET read = 1 WHERE id = ?',
-                (notification_id,)
-            )
-            await self.connection.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка отметки уведомления как прочитанного: {e}")
-            return False
-
-    # ========== МЕТОДЫ ДЛЯ ЛОГИРОВАНИЯ ДЕЙСТВИЙ ==========
+    # ========== МЕТОДЫ ДЛЯ ЛОГИРОВАНИЯ ==========
 
     async def log_action(self, user_id, action_type, details):
         """Логирует действия пользователей"""
@@ -818,7 +622,7 @@ class Database:
             await self.connection.commit()
             return True
         except Exception as e:
-            logger.error(f"Ошибка логирования действия: {e}")
+            logger.error(f"❌ Ошибка логирования действия пользователя {user_id}: {e}")
             return False
 
     async def get_recent_actions(self, org_id=None, limit=20):
@@ -848,7 +652,7 @@ class Database:
             await cursor.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Ошибка получения последних действий: {e}")
+            logger.error(f"❌ Ошибка получения последних действий: {e}")
             return []
 
     # ========== МЕТОДЫ ДЛЯ СТАТИСТИКИ ==========
@@ -858,7 +662,6 @@ class Database:
         try:
             stats = {}
             
-            # Количество смен за период
             cursor = await self.connection.execute(
                 '''SELECT COUNT(*) as count FROM shifts 
                    WHERE driver_id = ? 
@@ -868,7 +671,6 @@ class Database:
             shifts_count = await cursor.fetchone()
             stats['shifts_count'] = shifts_count['count'] if shifts_count else 0
             
-            # Средняя продолжительность смены
             cursor = await self.connection.execute(
                 '''SELECT AVG(
                     (julianday(end_time) - julianday(start_time)) * 24
@@ -881,7 +683,6 @@ class Database:
             avg_hours = await cursor.fetchone()
             stats['avg_shift_hours'] = round(avg_hours['avg_hours'], 1) if avg_hours and avg_hours['avg_hours'] else 0
             
-            # Количество использованной техники
             cursor = await self.connection.execute(
                 '''SELECT COUNT(DISTINCT equipment_id) as count FROM shifts 
                    WHERE driver_id = ? 
@@ -893,127 +694,19 @@ class Database:
             
             return stats
         except Exception as e:
-            logger.error(f"Ошибка получения статистики водителя: {e}")
+            logger.error(f"❌ Ошибка получения статистики водителя {driver_id}: {e}")
             return {}
 
-    async def get_statistics(self):
-        """Получает общую статистику"""
-        try:
-            stats = {}
-            
-            # Количество организаций
-            cursor = await self.connection.execute('SELECT COUNT(*) FROM organizations')
-            stats['organizations'] = (await cursor.fetchone())[0]
-            
-            # Количество пользователей
-            cursor = await self.connection.execute('SELECT COUNT(*) FROM users')
-            stats['users'] = (await cursor.fetchone())[0]
-            
-            # Количество техники
-            cursor = await self.connection.execute('SELECT COUNT(*) FROM equipment')
-            stats['equipment'] = (await cursor.fetchone())[0]
-            
-            # Количество активных смен
-            cursor = await self.connection.execute("SELECT COUNT(*) FROM shifts WHERE status = 'active'")
-            stats['active_shifts'] = (await cursor.fetchone())[0]
-            
-            # Количество предстоящих ТО
-            cursor = await self.connection.execute("SELECT COUNT(*) FROM maintenance WHERE status = 'scheduled'")
-            stats['upcoming_maintenance'] = (await cursor.fetchone())[0]
-            
-            # Распределение по ролям
-            cursor = await self.connection.execute('SELECT role, COUNT(*) FROM users GROUP BY role')
-            roles = await cursor.fetchall()
-            stats['roles'] = {role: count for role, count in roles}
-            
-            return stats
-        except Exception as e:
-            logger.error(f"Ошибка получения статистики: {e}")
-            return {}
-
-    # ========== МЕТОДЫ ДЛЯ ОТЧЕТОВ ==========
-
-    async def save_report(self, organization_id, report_type, period, data):
-        """Сохраняет отчет"""
-        try:
-            data_json = json.dumps(data, ensure_ascii=False)
-            await self.connection.execute(
-                'INSERT INTO reports (organization_id, report_type, period, data) VALUES (?, ?, ?, ?)',
-                (organization_id, report_type, period, data_json)
-            )
-            await self.connection.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка сохранения отчета: {e}")
-            return False
-
-    async def get_reports(self, organization_id, limit=10):
-        """Получает отчеты организации"""
-        try:
-            cursor = await self.connection.execute(
-                '''SELECT * FROM reports 
-                   WHERE organization_id = ? 
-                   ORDER BY created_at DESC 
-                   LIMIT ?''',
-                (organization_id, limit)
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            
-            reports = []
-            for row in rows:
-                report = dict(row)
-                try:
-                    report['data'] = json.loads(report['data'])
-                except:
-                    report['data'] = {}
-                reports.append(report)
-            
-            return reports
-        except Exception as e:
-            logger.error(f"Ошибка получения отчетов: {e}")
-            return []
-
-    # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
-
-    async def reset_database(self):
-        """Сбрасывает базу данных (только для тестов!)"""
-        try:
-            tables = ['organizations', 'users', 'equipment', 'shifts', 'maintenance', 
-                     'daily_checks', 'notifications', 'action_logs', 'reports']
-            for table in tables:
-                await self.connection.execute(f'DROP TABLE IF EXISTS {table}')
-            await self.connection.commit()
-            await self.create_tables()
-            logger.warning("⚠️ База данных сброшена!")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка сброса базы данных: {e}")
-            return False
-
-    async def backup_database(self):
-        """Создает резервную копию базы данных"""
-        try:
-            backup_path = f"{self.db_path}.backup"
-            
-            # Простое копирование файла SQLite
-            import shutil
-            if os.path.exists(self.db_path):
-                shutil.copy2(self.db_path, backup_path)
-                logger.info(f"✅ Резервная копия создана: {backup_path}")
-                return backup_path
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка создания резервной копии: {e}")
-            return None
+    # ========== ЗАКРЫТИЕ СОЕДИНЕНИЯ ==========
 
     async def close(self):
         """Закрывает соединение с базой данных"""
         try:
-            await self.connection.close()
-            logger.info("✅ Соединение с базой данных закрыто")
+            if self.connection:
+                await self.connection.close()
+                logger.info("✅ Соединение с базой данных закрыто")
         except Exception as e:
-            logger.error(f"Ошибка закрытия соединения: {e}")
+            logger.error(f"❌ Ошибка закрытия соединения: {e}")
 
-# Создаем глобальный экземпляр базы данных
+# Глобальный экземпляр базы данных
 db = Database()
