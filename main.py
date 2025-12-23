@@ -120,7 +120,7 @@ def get_main_keyboard(role, has_organization=False):
         'director': [
             [types.KeyboardButton(text="👨‍💼 Моя организация")],
             [types.KeyboardButton(text="🚜 Автопарк")],
-            [types.KeyboardButton(text="✏️ Редактировать технику")],  # НОВАЯ КНОПКА
+            [types.KeyboardButton(text="✏️ Редактировать технику")],
             [types.KeyboardButton(text="👥 Сотрудники")],
             [types.KeyboardButton(text="📈 Статистика организации")],
             [types.KeyboardButton(text="➕ Добавить технику")],
@@ -136,7 +136,7 @@ def get_main_keyboard(role, has_organization=False):
         'fleetmanager': [
             [types.KeyboardButton(text="👷 Управление парком")],
             [types.KeyboardButton(text="🚜 Техника")],
-            [types.KeyboardButton(text="✏️ Редактировать технику")],  # НОВАЯ КНОПКА
+            [types.KeyboardButton(text="✏️ Редактировать технику")],
             [types.KeyboardButton(text="👥 Водители")],
             [types.KeyboardButton(text="📊 Статистика водителей")],
             [types.KeyboardButton(text="➕ Добавить технику")],
@@ -231,9 +231,18 @@ def get_check_status_keyboard():
 async def cmd_start(message: types.Message, state: FSMContext):
     """Главное меню для всех"""
     await state.clear()
+    
+    # Регистрируем пользователя, если его нет
     user = await db.get_user(message.from_user.id)
+    if not user:
+        await db.register_user(
+            telegram_id=message.from_user.id,
+            full_name=message.from_user.full_name,
+            username=message.from_user.username
+        )
+        user = await db.get_user(message.from_user.id)
 
-    # Если пользователь НЕ найден в базе (НОВАЯ ЛОГИКА)
+    # Если пользователь НЕ найден в базе (хотя только что зарегистрировали)
     if not user:
         welcome_text = (
             "👋 <b>Добро пожаловать в ТехКонтроль!</b>\n\n"
@@ -389,11 +398,14 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     """Отменяет текущее действие"""
     await state.clear()
     user = await db.get_user(message.from_user.id)
-    await reply(
-        message,
-        "❌ Действие отменено. Возврат в главное меню.",
-        reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
-    )
+    if user:
+        await reply(
+            message,
+            "❌ Действие отменено. Возврат в главное меню.",
+            reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
+        )
+    else:
+        await reply(message, "❌ Действие отменено.")
 
 # ========== КОМАНДА ПОМОЩЬ ==========
 @dp.message(Command("help"))
@@ -437,11 +449,12 @@ async def cancel_handler(message: types.Message, state: FSMContext):
     
     await state.clear()
     user = await db.get_user(message.from_user.id)
-    await reply(
-        message,
-        "❌ Действие отменено. Возврат в главное меню.",
-        reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
-    )
+    if user:
+        await reply(
+            message,
+            "❌ Действие отменено. Возврат в главное меню.",
+            reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
+        )
 
 # ========== ОБРАБОТЧИКИ АДМИНИСТРАТОРА ==========
 
@@ -1989,7 +2002,7 @@ async def process_briefing_confirmation(message: types.Message, state: FSMContex
         await reply(message, "❌ Пожалуйста, выберите 'Да' или 'Нет'")
 
 async def notify_manager_about_shift_start(driver_id, equipment_id, shift_id):
-    """Уведомляет начальника парка о начале смены"""
+    """Уведомляет начальнику парка о начале смены"""
     try:
         # Получаем информацию о водителе
         driver = await db.get_user(driver_id)
@@ -2984,7 +2997,7 @@ async def on_startup():
     try:
         await db.connect()
         
-        # Создаем администратора
+        # Создаем администратора (замени на свой ID)
         ADMIN_ID = 1079922982  # ВАШ TELEGRAM ID
         await db.register_user(
             telegram_id=ADMIN_ID,
