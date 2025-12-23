@@ -68,6 +68,10 @@ class UserStates(StatesGroup):
     
     # Для поиска
     waiting_for_search_query = State()
+    
+    # Для управления техникой (НОВОЕ)
+    waiting_for_equipment_edit_choice = State()
+    waiting_for_equipment_edit_value = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -116,6 +120,7 @@ def get_main_keyboard(role, has_organization=False):
         'director': [
             [types.KeyboardButton(text="👨‍💼 Моя организация")],
             [types.KeyboardButton(text="🚜 Автопарк")],
+            [types.KeyboardButton(text="✏️ Редактировать технику")],  # НОВАЯ КНОПКА
             [types.KeyboardButton(text="👥 Сотрудники")],
             [types.KeyboardButton(text="📈 Статистика организации")],
             [types.KeyboardButton(text="➕ Добавить технику")],
@@ -131,6 +136,7 @@ def get_main_keyboard(role, has_organization=False):
         'fleetmanager': [
             [types.KeyboardButton(text="👷 Управление парком")],
             [types.KeyboardButton(text="🚜 Техника")],
+            [types.KeyboardButton(text="✏️ Редактировать технику")],  # НОВАЯ КНОПКА
             [types.KeyboardButton(text="👥 Водители")],
             [types.KeyboardButton(text="📊 Статистика водителей")],
             [types.KeyboardButton(text="➕ Добавить технику")],
@@ -224,25 +230,44 @@ def get_check_status_keyboard():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     """Главное меню для всех"""
-    # Сбрасываем состояние
     await state.clear()
-    
     user = await db.get_user(message.from_user.id)
-    
-    # Регистрируем, если пользователя нет
+
+    # Если пользователь НЕ найден в базе (НОВАЯ ЛОГИКА)
     if not user:
-        await db.register_user(
-            telegram_id=message.from_user.id,
-            full_name=f"{message.from_user.first_name} {message.from_user.last_name or ''}".strip(),
-            username=message.from_user.username,
-            role='driver'
+        welcome_text = (
+            "👋 <b>Добро пожаловать в ТехКонтроль!</b>\n\n"
+            "Я — бот для учета и контроля спецтехники, водителей и технического обслуживания.\n\n"
+            f"<b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
+            f"<b>Ваше имя:</b> {message.from_user.full_name}\n\n"
+            "⚠️ <b>Доступ к функциям бота ограничен.</b>\n"
+            "Для получения доступа обратитесь к администратору вашей организации.\n\n"
+            "<b>Что может бот?</b>\n"
+            "• Учет техники и ТО\n"
+            "• Управление сменами водителей\n"
+            "• Фотоосмотры перед рейсом\n"
+            "• Напоминания о ТО и документах\n"
+            "• Статистика и отчеты\n\n"
+            "📞 <b>Контакты:</b>\n"
+            "Для связи с администратором используйте команду /contact"
         )
-        user = await db.get_user(message.from_user.id)
-        await log_user_action(message.from_user.id, "registration", f"New user: {message.from_user.full_name}")
+        
+        # Создаем упрощенную клавиатуру только с информацией
+        keyboard = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="ℹ️ О боте")],
+                [types.KeyboardButton(text="📞 Контакты")],
+                [types.KeyboardButton(text="🆘 Помощь")]
+            ],
+            resize_keyboard=True,
+            input_field_placeholder="Выберите действие..."
+        )
+        await reply(message, welcome_text, reply_markup=keyboard)
+        return
     
+    # Если пользователь ЕСТЬ в базе (логика для существующих пользователей)
     role = user['role']
     has_organization = bool(user.get('organization_id'))
-    
     role_names = {
         'botadmin': '👑 Администратор бота',
         'director': '👨‍💼 Директор компании',
@@ -270,7 +295,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if role == 'director' and not has_organization:
         welcome_text += f"<b>Роль:</b> {role_names.get(role, '👤 Пользователь')}\n"
         welcome_text += "<b>Статус:</b> У вас ещё нет организации\n\n"
-        welcome_text += "📌 <b>Для начала работы создайте организацию:</b>"
+        welcome_text += "📌 <b>Для начала работы создайте организации:</b>"
     else:
         welcome_text += f"<b>Роль:</b> {role_names.get(role, '👤 Пользователь')}\n"
         welcome_text += f"<b>ID:</b> {message.from_user.id}\n"
@@ -281,6 +306,81 @@ async def cmd_start(message: types.Message, state: FSMContext):
         message,
         welcome_text,
         reply_markup=get_main_keyboard(role, has_organization)
+    )
+
+# ========== ИНФОРМАЦИОННЫЕ КНОПКИ ДЛЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ ==========
+
+@dp.message(F.text == "ℹ️ О боте")
+async def about_bot(message: types.Message):
+    """Информация о боте для новых пользователей"""
+    await reply(
+        message,
+        "🤖 <b>ТехКонтроль - Система учета спецтехники</b>\n\n"
+        "<b>Основные возможности:</b>\n"
+        "• 📊 Учет техники и история ТО\n"
+        "• 👷 Управление сменами водителей\n"
+        "• 📸 Фотоотчеты осмотра техники\n"
+        "• 🔔 Напоминания о ТО и документах\n"
+        "• 📈 Статистика и аналитика\n\n"
+        "<b>Для доступа к функциям:</b>\n"
+        "Обратитесь к администратору вашей организации.\n\n"
+        f"<b>Ваш ID для обращения:</b> <code>{message.from_user.id}</code>"
+    )
+
+@dp.message(F.text == "📞 Контакты")
+async def contacts(message: types.Message):
+    """Контакты администрации"""
+    await reply(
+        message,
+        "📞 <b>Контакты для связи</b>\n\n"
+        "По вопросам доступа к системе обращайтесь:\n\n"
+        "• К администратору вашей организации\n"
+        "• Или к системному администратору\n\n"
+        "<b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
+        "<b>Имя:</b> {message.from_user.full_name}\n\n"
+        "Сообщите эти данные для назначения роли.".format(
+            message.from_user.id,
+            message.from_user.full_name
+        )
+    )
+
+@dp.message(F.text == "🆘 Помощь")
+async def help_new_user(message: types.Message):
+    """Помощь для новых пользователей"""
+    await reply(
+        message,
+        "🆘 <b>Помощь</b>\n\n"
+        "<b>Я новичок. Что делать?</b>\n"
+        "1. Используйте кнопку '📞 Контакты'\n"
+        "2. Сообщите свой ID администратору\n"
+        "3. Дождитесь назначения роли\n\n"
+        "<b>Основные команды:</b>\n"
+        "/start - Главное меню\n"
+        "/help - Это сообщение\n"
+        "/myid - Показать мой ID\n\n"
+        f"<b>Ваш ID:</b> <code>{message.from_user.id}</code>"
+    )
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: types.Message):
+    """Показывает ID пользователя"""
+    await reply(
+        message,
+        f"🆔 <b>Ваш идентификатор:</b>\n\n"
+        f"<code>{message.from_user.id}</code>\n\n"
+        f"Сообщите этот номер администратору для получения доступа."
+    )
+
+@dp.message(Command("contact"))
+async def cmd_contact(message: types.Message):
+    """Команда для связи"""
+    await reply(
+        message,
+        "📞 <b>Связь с администрацией</b>\n\n"
+        f"<b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
+        f"<b>Имя:</b> {message.from_user.full_name}\n\n"
+        "Сообщите эти данные администратору для получения доступа к системе.\n\n"
+        "Если вы уже в организации, обратитесь к своему начальнику парка или директору."
     )
 
 # ========== КОМАНДА ОТМЕНА ==========
@@ -305,6 +405,8 @@ async def help_cmd(message: types.Message):
         "<b>Основные команды:</b>\n"
         "/start - Главное меню\n"
         "/myrole - Показать мою роль\n"
+        "/myid - Показать мой ID\n"
+        "/contact - Информация для связи\n"
         "/setrole - Назначить роль (администраторы)\n"
         "/createorg - Создать организацию (директора)\n"
         "/cancel - Отменить текущее действие\n"
@@ -1104,7 +1206,7 @@ async def add_equipment_start(message: types.Message, state: FSMContext):
     
     await reply(
         message,
-        "🚜 <b>Добавление техники</b>\n\n"
+        "🚜 <b>Добавление техника</b>\n\n"
         "Введите название техники:",
         reply_markup=get_cancel_keyboard()
     )
@@ -1240,6 +1342,201 @@ async def check_inspections(message: types.Message):
     if len(pending_shifts) > 5:
         await reply(message, f"... и ещё {len(pending_shifts) - 5} смен")
 
+# ========== РАСШИРЕННОЕ УПРАВЛЕНИЕ ТЕХНИКОЙ ==========
+
+@dp.message(F.text == "✏️ Редактировать технику")
+async def edit_equipment_start(message: types.Message, state: FSMContext):
+    """Начинает процесс редактирования техники"""
+    user = await db.get_user(message.from_user.id)
+    if user['role'] not in ['director', 'fleetmanager']:
+        await reply(message, "⛔ Доступ только для директора или начальника парка!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    # Получаем технику организации
+    equipment = await db.get_organization_equipment(org_id)
+    
+    if not equipment:
+        await reply(message, "🚜 <b>Техники пока нет</b>")
+        return
+    
+    # Создаем клавиатуру с техникой
+    keyboard = []
+    for eq in equipment[:10]:
+        keyboard.append([types.KeyboardButton(text=f"✏️ {eq['name']} ({eq['model']})")])
+    keyboard.append([types.KeyboardButton(text="❌ Отмена")])
+    
+    await state.update_data(equipment_list=equipment, org_id=org_id)
+    
+    await reply(
+        message,
+        "✏️ <b>Редактирование техники</b>\n\n"
+        "Выберите технику для редактирования:",
+        reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    )
+    await state.set_state(UserStates.waiting_for_equipment_selection)
+
+@dp.message(F.text.startswith("✏️ "), UserStates.waiting_for_equipment_selection)
+async def process_edit_equipment_selection(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор техники для редактирования"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Редактирование отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    data = await state.get_data()
+    equipment_list = data.get('equipment_list', [])
+    
+    # Ищем выбранную технику
+    selected_eq = None
+    for eq in equipment_list:
+        if f"✏️ {eq['name']} ({eq['model']})" == message.text:
+            selected_eq = eq
+            break
+    
+    if not selected_eq:
+        await reply(message, "❌ Пожалуйста, выберите технику из списка")
+        return
+    
+    await state.update_data(selected_equipment=selected_eq)
+    
+    # Предлагаем что редактировать
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="📝 Изменить название")],
+            [types.KeyboardButton(text="📝 Изменить модель")],
+            [types.KeyboardButton(text="🔧 Изменить статус")],
+            [types.KeyboardButton(text="📅 Изменить дату ТО")],
+            [types.KeyboardButton(text="📝 Добавить заметки")],
+            [types.KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await reply(
+        message,
+        f"✏️ <b>Редактирование:</b> {selected_eq['name']} ({selected_eq['model']})\n\n"
+        f"<b>Текущие данные:</b>\n"
+        f"• Название: {selected_eq['name']}\n"
+        f"• Модель: {selected_eq['model']}\n"
+        f"• VIN: {selected_eq['vin']}\n"
+        f"• Статус: {selected_eq['status']}\n"
+        f"• Следующее ТО: {selected_eq.get('next_maintenance', 'Не задано')}\n\n"
+        f"Выберите что хотите изменить:",
+        reply_markup=keyboard
+    )
+    await state.set_state(UserStates.waiting_for_equipment_edit_choice)
+
+@dp.message(UserStates.waiting_for_equipment_edit_choice)
+async def process_edit_choice(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор поля для редактирования"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Редактирование отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    edit_options = {
+        "📝 Изменить название": "Введите новое название техники:",
+        "📝 Изменить модель": "Введите новую модель техники:",
+        "🔧 Изменить статус": "Выберите новый статус:",
+        "📅 Изменить дату ТО": "Введите новую дату ТО (ДД.ММ.ГГГГ):",
+        "📝 Добавить заметки": "Введите заметки о технике:"
+    }
+    
+    if message.text not in edit_options:
+        await reply(message, "❌ Пожалуйста, выберите опцию из списка")
+        return
+    
+    await state.update_data(edit_field=message.text)
+    
+    if message.text == "🔧 Изменить статус":
+        # Клавиатура со статусами
+        keyboard = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="✅ Активная")],
+                [types.KeyboardButton(text="🔧 На ТО")],
+                [types.KeyboardButton(text="🔨 В ремонте")],
+                [types.KeyboardButton(text="💤 Резерв")],
+                [types.KeyboardButton(text="❌ Списана")],
+                [types.KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True
+        )
+        await reply(message, "Выберите новый статус техники:", reply_markup=keyboard)
+    else:
+        await reply(message, edit_options[message.text], reply_markup=get_cancel_keyboard())
+    
+    await state.set_state(UserStates.waiting_for_equipment_edit_value)
+
+@dp.message(UserStates.waiting_for_equipment_edit_value)
+async def process_edit_value(message: types.Message, state: FSMContext):
+    """Обрабатывает новое значение для техники"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Редактирование отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    data = await state.get_data()
+    selected_eq = data.get('selected_equipment')
+    edit_field = data.get('edit_field')
+    
+    if not selected_eq or not edit_field:
+        await state.clear()
+        await reply(message, "❌ Ошибка данных. Начните заново.")
+        return
+    
+    # Подготавливаем данные для обновления
+    update_data = {}
+    
+    if edit_field == "📝 Изменить название":
+        update_data['name'] = message.text
+    elif edit_field == "📝 Изменить модель":
+        update_data['model'] = message.text
+    elif edit_field == "🔧 Изменить статус":
+        status_map = {
+            "✅ Активная": "active",
+            "🔧 На ТО": "maintenance",
+            "🔨 В ремонте": "repair",
+            "💤 Резерв": "reserve",
+            "❌ Списана": "inactive"
+        }
+        update_data['status'] = status_map.get(message.text, "active")
+    elif edit_field == "📅 Изменить дату ТО":
+        try:
+            # Проверяем формат даты
+            datetime.strptime(message.text, "%d.%m.%Y")
+            update_data['next_maintenance'] = datetime.strptime(message.text, "%d.%m.%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            await reply(message, "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ")
+            return
+    elif edit_field == "📝 Добавить заметки":
+        update_data['notes'] = message.text
+    
+    # Обновляем технику в БД
+    success = await db.update_equipment(selected_eq['id'], **update_data)
+    
+    if success:
+        await reply(
+            message,
+            f"✅ <b>Техника успешно обновлена!</b>\n\n"
+            f"<b>Изменено:</b> {edit_field}\n"
+            f"<b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n"
+            f"<b>Новое значение:</b> {message.text}"
+        )
+    else:
+        await reply(message, "❌ Ошибка при обновлении техники!")
+    
+    await state.clear()
+    user = await db.get_user(message.from_user.id)
+    await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+
 # ========== ОБРАБОТЧИКИ НАЧАЛЬНИКА ПАРКА ==========
 
 @dp.message(F.text == "👷 Управление парком")
@@ -1281,7 +1578,7 @@ async def show_equipment_fleetmanager(message: types.Message):
 
 @dp.message(F.text == "👥 Водители")
 async def show_drivers(message: types.Message):
-    """Показывает водителей для начальника парка"""
+    """Показывает водители для начальника парка"""
     user = await db.get_user(message.from_user.id)
     if user['role'] != 'fleetmanager':
         await reply(message, "⛔ Доступ только для начальника парка!")
