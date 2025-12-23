@@ -39,7 +39,7 @@ class Database:
                     telegram_id INTEGER PRIMARY KEY,
                     full_name TEXT NOT NULL,
                     username TEXT,
-                    role TEXT NOT NULL DEFAULT 'driver',
+                    role TEXT NOT NULL DEFAULT 'unassigned',
                     organization_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (organization_id) REFERENCES organizations(id)
@@ -214,7 +214,7 @@ class Database:
             logger.error(f"Ошибка получения пользователя {telegram_id}: {e}")
             return None
     
-    async def register_user(self, telegram_id: int, full_name: str, username: str = None, role: str = 'driver') -> bool:
+    async def register_user(self, telegram_id: int, full_name: str, username: str = None, role: str = 'unassigned') -> bool:
         """Регистрирует нового пользователя"""
         try:
             await self.conn.execute(
