@@ -8,80 +8,111 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from datetime import datetime, timedelta
 import aioschedule
 from dotenv import load_dotenv
-
+import aiohttp
+import openai
+from typing import Optional, Dict, List
+ 
 from database import db
-
+ 
 # ========== НАСТРОЙКА ==========
 load_dotenv()
-
+ 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
+ 
+# Настройки ИИ
+AI_ENABLED = os.getenv('AI_ENABLED', 'False').lower() == 'true'
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY', '')
+ 
 # Инициализация бота
 bot = Bot(
     token=os.getenv('BOT_TOKEN'),
     default=DefaultBotProperties(parse_mode="HTML")
 )
-
+ 
 # Инициализация диспетчера
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
+ 
 # ========== СОСТОЯНИЯ ==========
 class UserStates(StatesGroup):
+    # Существующие состояния
     waiting_for_username_or_id = State()
     waiting_for_role = State()
     waiting_for_equipment_name = State()
     waiting_for_equipment_model = State()
     waiting_for_equipment_vin = State()
-    
-    # Для смен
     waiting_for_equipment_selection = State()
     waiting_for_briefing_confirmation = State()
     waiting_for_inspection_photo = State()
     waiting_for_daily_checks = State()
     waiting_for_shift_notes = State()
-    
-    # Для ТО
     waiting_for_maintenance_type = State()
     waiting_for_maintenance_date = State()
     waiting_for_maintenance_description = State()
-    
-    # Для уведомлений
     waiting_for_notification_text = State()
-    
-    # Для управления организацией
     waiting_for_org_name = State()
     waiting_for_edit_org_name = State()
     waiting_for_driver_stats_days = State()
-    
-    # Для отчетов
     waiting_for_report_type = State()
     waiting_for_report_period = State()
-    
-    # Для поиска
     waiting_for_search_query = State()
-    
-    # Для управления техникой (НОВОЕ)
     waiting_for_equipment_edit_choice = State()
     waiting_for_equipment_edit_value = State()
-
+    
+    # НОВЫЕ состояния для ИИ помощи
+    waiting_for_ai_question = State()
+    waiting_for_ai_followup = State()
+    
+    # НОВЫЕ состояния для учета топлива
+    waiting_for_fuel_equipment = State()
+    waiting_for_fuel_amount = State()
+    waiting_for_fuel_cost = State()
+    waiting_for_fuel_odometer = State()
+    waiting_for_fuel_photo = State()
+    waiting_for_fuel_notes = State()
+    
+    # НОВЫЕ состояния для запчастей
+    waiting_for_part_name = State()
+    waiting_for_part_details = State()
+    waiting_for_part_quantity = State()
+    waiting_for_part_supplier = State()
+    
+    # НОВЫЕ состояния для заказов
+    waiting_for_order_type = State()
+    waiting_for_order_details = State()
+    waiting_for_order_quantity = State()
+    waiting_for_order_urgency = State()
+    
+    # НОВЫЕ состояния для инструкций
+    waiting_for_instruction_search = State()
+    waiting_for_instruction_type = State()
+    
+    # НОВЫЕ состояния для расширенного ТО
+    waiting_for_maintenance_schedule_type = State()
+    waiting_for_maintenance_interval = State()
+    waiting_for_maintenance_parts = State()
+    
+    # НОВЫЕ состояния для аналитики
+    waiting_for_analytics_period = State()
+ 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
+ 
 async def log_user_action(user_id, action_type, details=""):
     """Логирует действие пользователя"""
     try:
         await db.log_action(user_id, action_type, details)
     except Exception as e:
         logger.error(f"Ошибка логирования действия: {e}")
-
+ 
 async def send_typing(chat_id):
     """Показывает 'печатает...'"""
     try:
@@ -89,19 +120,108 @@ async def send_typing(chat_id):
         await asyncio.sleep(0.1)
     except:
         pass
-
+ 
 async def reply(message, text, **kwargs):
     """Отправляет сообщение с индикатором набора"""
     await send_typing(message.chat.id)
     return await message.answer(text, **kwargs)
-
+ 
 async def send_to_user(user_id, text, **kwargs):
     """Отправляет сообщение пользователю по ID"""
     try:
         await bot.send_message(user_id, text, **kwargs)
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-
+ 
+async def ask_ai_assistant(question: str, context: str = "", user_id: int = None) -> str:
+    """Взаимодействие с ИИ для помощи по технике"""
+    if not AI_ENABLED:
+        return "🤖 Функция ИИ-помощника временно недоступна. Обратитесь к начальнику парка."
+    
+    try:
+        # Сначала проверяем локальную базу знаний
+        if user_id:
+            user = await db.get_user(user_id)
+            if user and user.get('organization_id'):
+                ai_contexts = await db.get_ai_context(
+                    organization_id=user['organization_id'],
+                    limit=5
+                )
+                if ai_contexts:
+                    # Добавляем контекст из базы
+                    context += "\n\nКонтекст из базы знаний:\n"
+                    for ctx in ai_contexts:
+                        context += f"Вопрос: {ctx['question']}\nОтвет: {ctx['answer']}\n\n"
+        
+        # Если есть OpenAI API ключ
+        if OPENAI_API_KEY:
+            openai.api_key = OPENAI_API_KEY
+            try:
+                response = await openai.ChatCompletion.acreate(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "Ты помощник по обслуживанию спецтехники. Отвечай профессионально и подробно."},
+                        {"role": "user", "content": f"{context}\n\nВопрос: {question}"}
+                    ],
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                answer = response.choices[0].message.content
+                
+                # Сохраняем в базу знаний
+                if user_id:
+                    user = await db.get_user(user_id)
+                    if user and user.get('organization_id'):
+                        await db.add_ai_context(
+                            organization_id=user['organization_id'],
+                            context_type="assistance",
+                            equipment_model="",
+                            question=question,
+                            answer=answer,
+                            source="ai"
+                        )
+                
+                return answer
+            except Exception as e:
+                logger.error(f"Ошибка OpenAI: {e}")
+        
+        # Запасной вариант: Hugging Face
+        if HUGGINGFACE_API_KEY:
+            try:
+                API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-large"
+                headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        API_URL,
+                        headers=headers,
+                        json={"inputs": f"Вопрос о спецтехнике: {question}. Ответь подробно."}
+                    ) as response:
+                        result = await response.json()
+                        if isinstance(result, list) and len(result) > 0:
+                            answer = result[0].get('generated_text', 'Извините, не могу ответить.')
+                            return answer
+            except Exception as e:
+                logger.error(f"Ошибка Hugging Face: {e}")
+        
+        # Запасные ответы
+        answers = {
+            "масло": "✅ Проверка масла:\n1. Заглушить двигатель и подождать 5 минут\n2. Вынуть щуп, протереть его\n3. Вставить щуп обратно и вынуть\n4. Уровень должен быть между метками MIN и MAX\n5. Цвет масла должен быть золотистым или светло-коричневым\n\n⚠️ Если масло черное или уровень низкий - требуется замена!",
+            "тормоза": "✅ Проверка тормозов:\n1. Проверить уровень тормозной жидкости\n2. Проверить износ тормозных колодок (мин. толщина 3мм)\n3. Проверить состояние тормозных дисков\n4. Прокачать тормозную систему при необходимости\n\n🚨 При скрипе или вибрации - обратиться к механику!",
+            "шины": "✅ Проверка шин:\n1. Давление: передние 8-9 бар, задние 6-7 бар\n2. Протектор: мин. глубина 3мм\n3. Внешний вид: нет порезов, гвоздей\n4. Балансировка: нет вибрации на скорости\n\n📅 Рекомендуется проверять давление еженедельно!",
+            "топливо": "✅ Заправка топлива:\n1. Использовать только дизельное топливо ДТ\n2. Заправляться только на проверенных АЗС\n3. Проверять чек и наличие акцизных марок\n4. Не заправляться 'под завязку'\n\n⛽ Норма расхода: 25-35л/100км в зависимости от нагрузки",
+        }
+        
+        for key, answer in answers.items():
+            if key in question.lower():
+                return answer
+        
+        return "🤖 Для точного ответа обратитесь к руководству по эксплуатации техники или к начальнику парка. Вы также можете уточнить вопрос."
+        
+    except Exception as e:
+        logger.error(f"Ошибка ИИ ассистента: {e}")
+        return "⚠️ Произошла ошибка при обработке запроса. Попробуйте еще раз или обратитесь к специалисту."
+ 
 def get_main_keyboard(role, has_organization=False):
     """Генерирует клавиатуру в зависимости от роли"""
     
@@ -114,7 +234,8 @@ def get_main_keyboard(role, has_organization=False):
             [types.KeyboardButton(text="➕ Назначить роль")],
             [types.KeyboardButton(text="🔔 Отправить уведомление")],
             [types.KeyboardButton(text="📋 Журнал действий")],
-            [types.KeyboardButton(text="🔍 Поиск")]
+            [types.KeyboardButton(text="🔍 Поиск")],
+            [types.KeyboardButton(text="🤖 ИИ Помощник")]
         ],
         
         'director': [
@@ -130,7 +251,12 @@ def get_main_keyboard(role, has_organization=False):
             [types.KeyboardButton(text="🔍 Проверить осмотры")],
             [types.KeyboardButton(text="📅 Ближайшие ТО")],
             [types.KeyboardButton(text="⚙️ Настройки организации")],
-            [types.KeyboardButton(text="🔍 Поиск")]
+            [types.KeyboardButton(text="🔍 Поиск")],
+            [types.KeyboardButton(text="⛽ Учет топлива")],
+            [types.KeyboardButton(text="🔧 Запчасти")],
+            [types.KeyboardButton(text="📦 Заказы")],
+            [types.KeyboardButton(text="🤖 ИИ Помощник")],
+            [types.KeyboardButton(text="📈 Аналитика")]
         ],
         
         'fleetmanager': [
@@ -144,7 +270,12 @@ def get_main_keyboard(role, has_organization=False):
             [types.KeyboardButton(text="➕ Назначить водителя")],
             [types.KeyboardButton(text="🔍 Проверить осмотры")],
             [types.KeyboardButton(text="📅 Ближайшие ТО")],
-            [types.KeyboardButton(text="🔍 Поиск")]
+            [types.KeyboardButton(text="🔍 Поиск")],
+            [types.KeyboardButton(text="⛽ Учет топлива")],
+            [types.KeyboardButton(text="🔧 Запчасти")],
+            [types.KeyboardButton(text="📦 Заказы")],
+            [types.KeyboardButton(text="📋 Инструкции")],
+            [types.KeyboardButton(text="🤖 ИИ Помощник")]
         ],
         
         'driver': [
@@ -153,26 +284,32 @@ def get_main_keyboard(role, has_organization=False):
             [types.KeyboardButton(text="📊 Моя статистика")],
             [types.KeyboardButton(text="✅ Закончить смену")],
             [types.KeyboardButton(text="🚜 Моя техника")],
+            [types.KeyboardButton(text="⛽ Заправить технику")],
+            [types.KeyboardButton(text="🔧 Заказать запчасть")],
+            [types.KeyboardButton(text="📋 Инструкции")],
+            [types.KeyboardButton(text="🤖 ИИ Помощник")],
             [types.KeyboardButton(text="ℹ️ Информация")]
         ]
     }
     
-    # Для директора без организации показываем упрощенное меню
+    # Для директора без организации
     if role == 'director' and not has_organization:
         return types.ReplyKeyboardMarkup(
             keyboard=[
                 [types.KeyboardButton(text="🏢 Создать организацию")],
-                [types.KeyboardButton(text="ℹ️ Информация")]
+                [types.KeyboardButton(text="ℹ️ Информация")],
+                [types.KeyboardButton(text="🤖 ИИ Помощник")]
             ],
             resize_keyboard=True,
             input_field_placeholder="Выберите действие..."
         )
     
-    # Для ролей без организации (кроме директора)
+    # Для ролей без организации
     if role in ['fleetmanager', 'driver'] and not has_organization:
         return types.ReplyKeyboardMarkup(
             keyboard=[
-                [types.KeyboardButton(text="ℹ️ Информация")]
+                [types.KeyboardButton(text="ℹ️ Информация")],
+                [types.KeyboardButton(text="🤖 ИИ Помощник")]
             ],
             resize_keyboard=True,
             input_field_placeholder="Ожидайте назначения..."
@@ -183,14 +320,14 @@ def get_main_keyboard(role, has_organization=False):
         resize_keyboard=True,
         input_field_placeholder="Выберите действие..."
     )
-
+ 
 def get_cancel_keyboard():
     """Клавиатура с кнопкой отмена"""
     return types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True
     )
-
+ 
 def get_yes_no_keyboard():
     """Клавиатура Да/Нет"""
     return types.ReplyKeyboardMarkup(
@@ -200,7 +337,7 @@ def get_yes_no_keyboard():
         ],
         resize_keyboard=True
     )
-
+ 
 def get_period_keyboard():
     """Клавиатура для выбора периода"""
     return types.ReplyKeyboardMarkup(
@@ -214,25 +351,51 @@ def get_period_keyboard():
         ],
         resize_keyboard=True
     )
-
-def get_check_status_keyboard():
-    """Клавиатура для статуса проверки"""
+ 
+def get_fuel_type_keyboard():
+    """Клавиатура для выбора типа топлива"""
     return types.ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="✅ Исправно"), types.KeyboardButton(text="⚠️ Требует внимания")],
-            [types.KeyboardButton(text="❌ Неисправно"), types.KeyboardButton(text="⏭️ Пропустить")],
+            [types.KeyboardButton(text="⛽ Дизель ДТ")],
+            [types.KeyboardButton(text="⛽ Бензин АИ-92")],
+            [types.KeyboardButton(text="⛽ Бензин АИ-95")],
+            [types.KeyboardButton(text="⚡ Электричество")],
             [types.KeyboardButton(text="❌ Отмена")]
         ],
         resize_keyboard=True
     )
-
+ 
+def get_order_type_keyboard():
+    """Клавиатура для выбора типа заказа"""
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🔧 Запчасть")],
+            [types.KeyboardButton(text="⛽ Топливо")],
+            [types.KeyboardButton(text="🛠️ Услуга")],
+            [types.KeyboardButton(text="📋 Другое")],
+            [types.KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+ 
+def get_urgency_keyboard():
+    """Клавиатура для выбора срочности"""
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🚨 Срочно (сегодня)")],
+            [types.KeyboardButton(text="⚠️ Средняя (1-3 дня)")],
+            [types.KeyboardButton(text="📅 Не срочно (неделя)")],
+            [types.KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+ 
 # ========== КОМАНДА СТАРТ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     """Главное меню для всех"""
     await state.clear()
     
-    # Регистрируем пользователя, если его нет
     user = await db.get_user(message.from_user.id)
     if not user:
         await db.register_user(
@@ -241,30 +404,26 @@ async def cmd_start(message: types.Message, state: FSMContext):
             username=message.from_user.username
         )
         user = await db.get_user(message.from_user.id)
-
-    # Если пользователь НЕ найден в базе (хотя только что зарегистрировали)
+ 
     if not user:
         welcome_text = (
-            "👋 <b>Добро пожаловать в ТехКонтроль!</b>\n\n"
-            "Я — бот для учета и контроля спецтехники, водителей и технического обслуживания.\n\n"
+            "👋 <b>Добро пожаловать в ТехКонтроль 2.0!</b>\n\n"
+            "Я — умный бот для учета и контроля спецтехники с ИИ-помощником.\n\n"
             f"<b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
             f"<b>Ваше имя:</b> {message.from_user.full_name}\n\n"
-            "⚠️ <b>Доступ к функциям бота ограничен.</b>\n"
-            "Для получения доступа обратитесь к администратору вашей организации.\n\n"
-            "<b>Что может бот?</b>\n"
-            "• Учет техники и ТО\n"
-            "• Управление сменами водителей\n"
-            "• Фотоосмотры перед рейсом\n"
-            "• Напоминания о ТО и документах\n"
-            "• Статистика и отчеты\n\n"
-            "📞 <b>Контакты:</b>\n"
-            "Для связи с администратором используйте команду /contact"
+            "🚀 <b>Новые возможности:</b>\n"
+            "• 🤖 ИИ-помощник по обслуживанию\n"
+            "• ⛽ Учет топлива и аналитика расхода\n"
+            "• 🔧 Управление запчастями\n"
+            "• 📦 Система заказов\n"
+            "• 📋 Интерактивные инструкции\n\n"
+            "Для получения доступа обратитесь к администратору."
         )
         
-        # Создаем упрощенную клавиатуру только с информацией
         keyboard = types.ReplyKeyboardMarkup(
             keyboard=[
                 [types.KeyboardButton(text="ℹ️ О боте")],
+                [types.KeyboardButton(text="🤖 ИИ Помощник")],
                 [types.KeyboardButton(text="📞 Контакты")],
                 [types.KeyboardButton(text="🆘 Помощь")]
             ],
@@ -274,7 +433,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await reply(message, welcome_text, reply_markup=keyboard)
         return
     
-    # Если пользователь ЕСТЬ в базе (логика для существующих пользователей)
     role = user['role']
     has_organization = bool(user.get('organization_id'))
     role_names = {
@@ -284,7 +442,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         'driver': '🚛 Водитель'
     }
     
-    # Проверяем активную смену для водителя
     if role == 'driver':
         active_shift = await db.get_active_shift(message.from_user.id)
         if active_shift:
@@ -293,13 +450,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 f"🚛 <b>У вас активная смена!</b>\n\n"
                 f"<b>Техника:</b> {active_shift.get('equipment_name', 'Не указана')}\n"
                 f"<b>Начало:</b> {active_shift['start_time'][:16]}\n"
+                f"<b>Пробег:</b> {active_shift.get('odometer', 'Не указан')} км\n"
                 f"<b>Статус осмотра:</b> {'✅ Подтверждён' if active_shift['inspection_approved'] else '⏳ Ожидает проверки'}\n\n"
                 f"Вы можете завершить смену через меню.",
                 reply_markup=get_main_keyboard(role, has_organization)
             )
             return
     
-    welcome_text = f"🤖 <b>ТехКонтроль Бот</b>\n\n"
+    welcome_text = f"🤖 <b>ТехКонтроль 2.0</b>\n\n"
     
     if role == 'director' and not has_organization:
         welcome_text += f"<b>Роль:</b> {role_names.get(role, '👤 Пользователь')}\n"
@@ -316,1369 +474,243 @@ async def cmd_start(message: types.Message, state: FSMContext):
         welcome_text,
         reply_markup=get_main_keyboard(role, has_organization)
     )
-
-# ========== ИНФОРМАЦИОННЫЕ КНОПКИ ДЛЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ ==========
-
-@dp.message(F.text == "ℹ️ О боте")
-async def about_bot(message: types.Message):
-    """Информация о боте для новых пользователей"""
-    await reply(
-        message,
-        "🤖 <b>ТехКонтроль - Система учета спецтехники</b>\n\n"
-        "<b>Основные возможности:</b>\n"
-        "• 📊 Учет техники и история ТО\n"
-        "• 👷 Управление сменами водителей\n"
-        "• 📸 Фотоотчеты осмотра техники\n"
-        "• 🔔 Напоминания о ТО и документах\n"
-        "• 📈 Статистика и аналитика\n\n"
-        "<b>Для доступа к функциям:</b>\n"
-        "Обратитесь к администратору вашей организации.\n\n"
-        f"<b>Ваш ID для обращения:</b> <code>{message.from_user.id}</code>"
-    )
-
-@dp.message(F.text == "📞 Контакты")
-async def contacts(message: types.Message):
-    """Контакты администрации"""
-    await reply(
-        message,
-        "📞 <b>Контакты для связи</b>\n\n"
-        "По вопросам доступа к системе обращайтесь:\n\n"
-        "• К администратору вашей организации\n"
-        "• Или к системному администратору\n\n"
-        "<b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
-        "<b>Имя:</b> {message.from_user.full_name}\n\n"
-        "Сообщите эти данные для назначения роли.".format(
-            message.from_user.id,
-            message.from_user.full_name
-        )
-    )
-
-@dp.message(F.text == "🆘 Помощь")
-async def help_new_user(message: types.Message):
-    """Помощь для новых пользователей"""
-    await reply(
-        message,
-        "🆘 <b>Помощь</b>\n\n"
-        "<b>Я новичок. Что делать?</b>\n"
-        "1. Используйте кнопку '📞 Контакты'\n"
-        "2. Сообщите свой ID администратору\n"
-        "3. Дождитесь назначения роли\n\n"
-        "<b>Основные команды:</b>\n"
-        "/start - Главное меню\n"
-        "/help - Это сообщение\n"
-        "/myid - Показать мой ID\n\n"
-        f"<b>Ваш ID:</b> <code>{message.from_user.id}</code>"
-    )
-
-@dp.message(Command("myid"))
-async def cmd_myid(message: types.Message):
-    """Показывает ID пользователя"""
-    await reply(
-        message,
-        f"🆔 <b>Ваш идентификатор:</b>\n\n"
-        f"<code>{message.from_user.id}</code>\n\n"
-        f"Сообщите этот номер администратору для получения доступа."
-    )
-
-@dp.message(Command("contact"))
-async def cmd_contact(message: types.Message):
-    """Команда для связи"""
-    await reply(
-        message,
-        "📞 <b>Связь с администрацией</b>\n\n"
-        f"<b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
-        f"<b>Имя:</b> {message.from_user.full_name}\n\n"
-        "Сообщите эти данные администратору для получения доступа к системе.\n\n"
-        "Если вы уже в организации, обратитесь к своему начальнику парка или директору."
-    )
-
-# ========== КОМАНДА ОТМЕНА ==========
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    """Отменяет текущее действие"""
-    await state.clear()
+ 
+# ========== ИИ ПОМОЩНИК ==========
+ 
+@dp.message(F.text == "🤖 ИИ Помощник")
+async def ai_assistant_start(message: types.Message, state: FSMContext):
+    """Начинает диалог с ИИ помощником"""
     user = await db.get_user(message.from_user.id)
-    if user:
-        await reply(
-            message,
-            "❌ Действие отменено. Возврат в главное меню.",
-            reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
-        )
-    else:
-        await reply(message, "❌ Действие отменено.")
-
-# ========== КОМАНДА ПОМОЩЬ ==========
-@dp.message(Command("help"))
-async def help_cmd(message: types.Message):
-    """Показывает справку"""
-    await reply(
-        message,
-        "🤖 <b>ТехКонтроль Бот - Справка</b>\n\n"
-        "<b>Основные команды:</b>\n"
-        "/start - Главное меню\n"
-        "/myrole - Показать мою роль\n"
-        "/myid - Показать мой ID\n"
-        "/contact - Информация для связи\n"
-        "/setrole - Назначить роль (администраторы)\n"
-        "/createorg - Создать организацию (директора)\n"
-        "/cancel - Отменить текущее действие\n"
-        "/help - Эта справка\n\n"
-        "<b>Система ролей:</b>\n"
-        "• Администратор - полный доступ\n"
-        "• Директор - управление организацией\n"
-        "• Начальник парка - управление техникой\n"
-        "• Водитель - работа со сменами\n\n"
-        "<b>Основные функции:</b>\n"
-        "• Создание и управление организациями\n"
-        "• Учет техники и ТО\n"
-        "• Начало и завершение смен\n"
-        "• Фото осмотра техники\n"
-        "• Статистика и отчеты\n"
-        "• Журнал действий"
-    )
-
-# ========== ОБРАБОТЧИКИ ТЕКСТОВЫХ КОМАНД ==========
-
-# Обработчик для кнопки "❌ Отмена"
-@dp.message(F.text == "❌ Отмена")
-async def cancel_handler(message: types.Message, state: FSMContext):
-    """Обрабатывает кнопку отмена"""
-    current_state = await state.get_state()
-    if current_state is None:
-        return
     
-    await state.clear()
-    user = await db.get_user(message.from_user.id)
-    if user:
-        await reply(
-            message,
-            "❌ Действие отменено. Возврат в главное меню.",
-            reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
-        )
-
-# ========== ОБРАБОТЧИКИ АДМИНИСТРАТОРА ==========
-
-@dp.message(F.text == "👑 Админ-панель")
-async def admin_panel(message: types.Message):
-    """Панель администратора"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
-        return
-    
-    organizations = await db.get_all_organizations()
-    users = await db.get_all_users()
-    
-    await reply(
-        message,
-        "👑 <b>Панель администратора</b>\n\n"
-        f"<b>Организаций:</b> {len(organizations)}\n"
-        f"<b>Пользователей:</b> {len(users)}\n\n"
-        "<b>Доступные действия:</b>\n"
-        "• Просмотр всех организаций\n"
-        "• Просмотр всех пользователей\n"
-        "• Назначение ролей\n"
-        "• Просмотр статистики\n"
-        "• Отправка уведомлений\n"
-        "• Просмотр журнала действий"
-    )
-
-@dp.message(F.text == "🏢 Все организации")
-async def show_all_organizations(message: types.Message):
-    """Показывает все организации"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
-        return
-    
-    organizations = await db.get_all_organizations()
-    
-    if not organizations:
-        await reply(message, "🏢 <b>Организаций пока нет</b>")
-        return
-    
-    text = "🏢 <b>Все организации</b>\n\n"
-    
-    for org in organizations:
-        # Получаем информацию о директоре
-        director_info = "Не назначен"
-        if org['director_id']:
-            director = await db.get_user(org['director_id'])
-            if director:
-                director_info = f"{director['full_name']} (ID: {director['telegram_id']})"
-        
-        # Получаем количество сотрудников и техники
-        users_count = len(await db.get_users_by_organization(org['id']))
-        equipment_count = len(await db.get_organization_equipment(org['id']))
-        
-        text += f"<b>• {org['name']}</b>\n"
-        text += f"  ID организации: {org['id']}\n"
-        text += f"  Директор: {director_info}\n"
-        text += f"  Сотрудников: {users_count}\n"
-        text += f"  Техники: {equipment_count}\n"
-        text += f"  Создана: {org['created_at'][:10]}\n\n"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "👥 Все пользователи")
-async def show_all_users(message: types.Message):
-    """Показывает всех пользователей"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
-        return
-    
-    users = await db.get_all_users()
-    
-    if not users:
-        await reply(message, "👥 <b>Пользователей пока нет</b>")
-        return
-    
-    # Группируем по ролям
-    roles_count = {}
-    for u in users:
-        roles_count[u['role']] = roles_count.get(u['role'], 0) + 1
-    
-    text = "👥 <b>Все пользователи</b>\n\n"
-    text += "<b>Статистика по ролям:</b>\n"
-    
-    role_names = {
-        'botadmin': '👑 Администратор',
-        'director': '👨‍💼 Директор',
-        'fleetmanager': '👷 Начальник парка',
-        'driver': '🚛 Водитель'
-    }
-    
-    for role, count in roles_count.items():
-        text += f"• {role_names.get(role, role)}: {count} чел.\n"
-    
-    text += f"\n<b>Всего:</b> {len(users)} пользователей"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "📊 Статистика")
-async def show_statistics(message: types.Message):
-    """Показывает статистику"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
-        return
-    
-    organizations = await db.get_all_organizations()
-    users = await db.get_all_users()
-    
-    # Подсчитываем активные смены
-    active_shifts_count = 0
-    for u in users:
-        if u['role'] == 'driver':
-            shift = await db.get_active_shift(u['telegram_id'])
-            if shift:
-                active_shifts_count += 1
-    
-    # Статистика по организациям
-    orgs_with_directors = len([o for o in organizations if o['director_id']])
-    total_equipment = 0
-    for org in organizations:
-        equipment = await db.get_organization_equipment(org['id'])
-        total_equipment += len(equipment)
-    
-    text = (
-        "📊 <b>Статистика системы</b>\n\n"
-        f"<b>Организаций:</b> {len(organizations)}\n"
-        f"<b>С назначенными директорами:</b> {orgs_with_directors}\n"
-        f"<b>Пользователей:</b> {len(users)}\n"
-        f"<b>Техники всего:</b> {total_equipment} ед.\n"
-        f"<b>Активных смен:</b> {active_shifts_count}\n\n"
-        "<b>Распределение по ролям:</b>\n"
-    )
-    
-    # Считаем роли
-    roles = {}
-    for u in users:
-        roles[u['role']] = roles.get(u['role'], 0) + 1
-    
-    for role, count in roles.items():
-        text += f"• {role}: {count} чел.\n"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "🔔 Отправить уведомление")
-async def send_notification_start(message: types.Message, state: FSMContext):
-    """Начинает отправку уведомления всем пользователям"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
+    if not user:
+        await reply(message, "❌ Сначала зарегистрируйтесь через /start")
         return
     
     await reply(
         message,
-        "🔔 <b>Отправка уведомления всем пользователям</b>\n\n"
-        "Введите текст уведомления:",
+        "🤖 <b>ИИ Помощник по обслуживанию техники</b>\n\n"
+        "Задайте вопрос о:\n"
+        "• Обслуживании техники\n"
+        "• Проверках и осмотрах\n"
+        "• Ремонте и устранении неисправностей\n"
+        "• Расходе топлива\n"
+        "• ТО и техническому обслуживанию\n"
+        "• Работе с техникой\n\n"
+        "<i>Примеры вопросов:</i>\n"
+        "• Как проверить масло в двигателе?\n"
+        "• Какое давление в шинах должно быть?\n"
+        "• Как часто нужно делать ТО?\n"
+        "• Почему техника не заводится?\n\n"
+        "Введите ваш вопрос:",
         reply_markup=get_cancel_keyboard()
     )
-    await state.set_state(UserStates.waiting_for_notification_text)
-
-@dp.message(UserStates.waiting_for_notification_text)
-async def process_notification_text(message: types.Message, state: FSMContext):
-    """Обрабатывает текст уведомления"""
+    await state.set_state(UserStates.waiting_for_ai_question)
+ 
+@dp.message(UserStates.waiting_for_ai_question)
+async def process_ai_question(message: types.Message, state: FSMContext):
+    """Обрабатывает вопрос к ИИ"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Отправка уведомления отменена", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        await reply(message, "❌ Диалог с ИИ отменен", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
         return
     
-    notification_text = message.text
+    question = message.text.strip()
     
-    # Получаем всех пользователей
-    all_users = await db.get_all_users()
+    if len(question) < 3:
+        await reply(message, "❌ Вопрос слишком короткий. Уточните, пожалуйста.")
+        return
     
-    await reply(
-        message,
-        f"✅ <b>Уведомление подготовлено</b>\n\n"
-        f"Текст: {notification_text}\n\n"
-        f"Будет отправлено {len(all_users)} пользователям.\n"
-        f"Начинаю отправку..."
-    )
+    await reply(message, "🤖 <b>ИИ думает...</b>\n\nПожалуйста, подождите...")
     
-    # Отправляем уведомления
-    sent_count = 0
-    failed_count = 0
-    
-    for user in all_users:
-        try:
-            await send_to_user(
-                user['telegram_id'],
-                f"🔔 <b>Уведомление от администратора</b>\n\n"
-                f"{notification_text}\n\n"
-                f"<i>Если у вас есть вопросы, обратитесь к администратору.</i>"
-            )
-            sent_count += 1
-            await asyncio.sleep(0.1)  # Чтобы не превысить лимиты Telegram
-        except Exception as e:
-            failed_count += 1
-            logger.error(f"Не удалось отправить уведомление пользователю {user['telegram_id']}: {e}")
-    
-    await reply(
-        message,
-        f"📨 <b>Уведомления отправлены!</b>\n\n"
-        f"Успешно: {sent_count}\n"
-        f"Не удалось: {failed_count}\n"
-        f"Всего: {len(all_users)} пользователей"
-    )
-    
-    await state.clear()
-    await cmd_start(message, state)
-
-@dp.message(F.text == "📋 Журнал действий")
-async def action_logs(message: types.Message):
-    """Показывает журнал действий"""
+    # Получаем контекст пользователя
     user = await db.get_user(message.from_user.id)
+    context = ""
     
-    if user['role'] != 'botadmin':
-        await reply(message, "⛔ Доступ только для администратора!")
-        return
+    if user and user.get('organization_id'):
+        # Получаем технику пользователя для контекста
+        if user['role'] == 'driver':
+            equipment = await db.get_equipment_by_driver(message.from_user.id)
+            if equipment:
+                context = "Техника водителя:\n"
+                for eq in equipment[:3]:
+                    context += f"- {eq['name']} ({eq['model']})\n"
     
-    # Получаем последние 20 действий
-    actions = await db.get_recent_actions(limit=20)
+    # Получаем ответ от ИИ
+    answer = await ask_ai_assistant(question, context, message.from_user.id)
     
-    if not actions:
-        await reply(message, "📋 <b>Журнал действий пуст</b>")
-        return
-    
-    text = "📋 <b>Журнал действий (последние 20)</b>\n\n"
-    
-    for action in actions:
-        time = datetime.strptime(action['created_at'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
-        user_name = action['full_name']
-        role = action['role']
-        
-        role_emoji = {
-            'botadmin': '👑',
-            'director': '👨‍💼',
-            'fleetmanager': '👷',
-            'driver': '🚛'
-        }.get(role, '👤')
-        
-        text += f"<b>{time}</b> {role_emoji} {user_name}\n"
-        text += f"   {action['action_type']}\n"
-        if action['details']:
-            text += f"   <i>{action['details'][:50]}</i>\n"
-        text += "\n"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "🔍 Поиск")
-async def search_start(message: types.Message, state: FSMContext):
-    """Начинает поиск"""
-    user = await db.get_user(message.from_user.id)
-    
-    # Проверяем права
-    if user['role'] == 'driver':
-        await reply(message, "⛔ У водителей нет доступа к поиску!")
-        return
-    
-    await reply(
-        message,
-        "🔍 <b>Поиск по системе</b>\n\n"
-        "Введите запрос для поиска:\n"
-        "(можно искать пользователей, технику, организации)",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(UserStates.waiting_for_search_query)
-
-@dp.message(UserStates.waiting_for_search_query)
-async def process_search_query(message: types.Message, state: FSMContext):
-    """Обрабатывает поисковый запрос"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Поиск отменен", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    search_query = message.text.strip()
-    
-    if len(search_query) < 2:
-        await reply(message, "❌ Слишком короткий запрос!")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    results_text = f"🔍 <b>Результаты поиска:</b> '{search_query}'\n\n"
-    
-    # Поиск пользователей
-    all_users = await db.get_all_users()
-    user_results = []
-    
-    for u in all_users:
-        if (search_query.lower() in u['full_name'].lower() or 
-            (u['username'] and search_query.lower() in u['username'].lower()) or
-            search_query == str(u['telegram_id'])):
-            user_results.append(u)
-    
-    if user_results:
-        results_text += f"👥 <b>Пользователи ({len(user_results)}):</b>\n"
-        for u in user_results[:5]:  # Показываем первые 5
-            role_names = {
-                'botadmin': '👑 Админ',
-                'director': '👨‍💼 Директор',
-                'fleetmanager': '👷 Нач. парка',
-                'driver': '🚛 Водитель'
-            }
-            results_text += f"• {role_names.get(u['role'], u['role'])} {u['full_name']}"
-            if u['username']:
-                results_text += f" (@{u['username']})"
-            results_text += f" (ID: {u['telegram_id']})\n"
-        
-        if len(user_results) > 5:
-            results_text += f"... и ещё {len(user_results) - 5}\n"
-        results_text += "\n"
-    
-    # Поиск организаций (только для администратора)
-    if user['role'] == 'botadmin':
-        all_orgs = await db.get_all_organizations()
-        org_results = [o for o in all_orgs if search_query.lower() in o['name'].lower()]
-        
-        if org_results:
-            results_text += f"🏢 <b>Организации ({len(org_results)}):</b>\n"
-            for o in org_results[:3]:
-                results_text += f"• {o['name']} (ID: {o['id']})\n"
-            
-            if len(org_results) > 3:
-                results_text += f"... и ещё {len(org_results) - 3}\n"
-            results_text += "\n"
-    
-    # Поиск техники (для директора и начальника парка)
-    if user['role'] in ['director', 'fleetmanager'] and user.get('organization_id'):
-        equipment = await db.get_organization_equipment(user['organization_id'])
-        eq_results = []
-        
-        for eq in equipment:
-            if (search_query.lower() in eq['name'].lower() or 
-                search_query.lower() in eq['model'].lower() or
-                search_query.lower() in eq['vin'].lower()):
-                eq_results.append(eq)
-        
-        if eq_results:
-            results_text += f"🚜 <b>Техника ({len(eq_results)}):</b>\n"
-            for eq in eq_results[:3]:
-                results_text += f"• {eq['name']} ({eq['model']}) - VIN: {eq['vin'][:8]}...\n"
-            
-            if len(eq_results) > 3:
-                results_text += f"... и ещё {len(eq_results) - 3}\n"
-    
-    if results_text == f"🔍 <b>Результаты поиска:</b> '{search_query}'\n\n":
-        results_text += "😕 Ничего не найдено."
-    
-    await reply(message, results_text)
-    await state.clear()
-
-# ========== УПРАВЛЕНИЕ ОРГАНИЗАЦИЕЙ ДЛЯ ДИРЕКТОРА ==========
-
-@dp.message(F.text == "🏢 Создать организацию")
-async def create_organization_start(message: types.Message, state: FSMContext):
-    """Начинает создание организации"""
-    user = await db.get_user(message.from_user.id)
-    
-    if user['role'] != 'director':
-        await reply(message, "⛔ Только директора могут создавать организации!")
-        return
-    
-    if user.get('organization_id'):
-        await reply(message, "⚠️ У вас уже есть организация!")
-        return
-    
-    await reply(
-        message,
-        "🏢 <b>Создание организации</b>\n\n"
-        "Введите название вашей организации:\n\n"
-        "<b>Примеры:</b>\n"
-        "• ООО 'Моя Компания'\n"
-        "• ИП Иванов\n"
-        "• Строительная компания 'Проект'",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(UserStates.waiting_for_org_name)
-
-@dp.message(UserStates.waiting_for_org_name)
-async def process_org_name(message: types.Message, state: FSMContext):
-    """Обрабатывает ввод названия организации"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await cmd_start(message, state)
-        return
-    
-    org_name = message.text.strip()
-    
-    if len(org_name) < 2:
-        await reply(message, "❌ Название организации слишком короткое!")
-        return
-    
-    # Создаем организацию
-    org_id, error = await db.create_organization_for_director(message.from_user.id, org_name)
-    
-    if error:
-        await reply(message, f"❌ {error}")
-        await state.clear()
-        await cmd_start(message, state)
-        return
-    
-    if org_id:
-        await log_user_action(message.from_user.id, "organization_created", f"Organization: {org_name}")
-        
-        await reply(
-            message,
-            f"✅ <b>Организация создана успешно!</b>\n\n"
-            f"<b>Название:</b> {org_name}\n"
-            f"<b>ID организации:</b> {org_id}\n\n"
-            f"<b>Теперь вы можете:</b>\n"
-            "• Добавлять технику\n"
-            "• Назначать сотрудников\n"
-            "• Управлять автопарком\n"
-            "• Создавать ТО\n"
-            "• Просматривать статистику"
-        )
-        
-        # Обновляем пользователя чтобы получить актуальные данные
-        user = await db.get_user(message.from_user.id)
-        await state.clear()
-        await cmd_start(message, state)
-    else:
-        await reply(message, "❌ Ошибка при создании организации!")
-
-@dp.message(F.text == "👨‍💼 Моя организация")
-async def director_org(message: types.Message):
-    """Организация директора"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'director':
-        await reply(message, "⛔ Доступ только для директора!")
-        return
-    
-    org_id = user.get('organization_id')
-    
-    if not org_id:
-        await reply(
-            message,
-            "🏢 <b>Создание организации</b>\n\n"
-            "У вас ещё нет организации.\n"
-            "Создайте её через меню '🏢 Создать организацию'."
-        )
-        return
-    
-    org = await db.get_organization(org_id)
-    users = await db.get_users_by_organization(org_id)
-    equipment = await db.get_organization_equipment(org_id)
-    
-    text = (
-        f"🏢 <b>Организация: {org['name']}</b>\n\n"
-        f"<b>ID организации:</b> {org_id}\n"
-        f"<b>Директор:</b> {user['full_name']}\n"
-        f"<b>Создана:</b> {org['created_at'][:10]}\n\n"
-        f"<b>Сотрудники:</b> {len(users)} чел.\n"
-        f"<b>Техника:</b> {len(equipment)} ед.\n\n"
-        "<b>Доступные действия:</b>\n"
-        "• Просмотр автопарка\n"
-        "• Просмотр сотрудников\n"
-        "• Добавление техники\n"
-        "• Назначение ролей\n"
-        "• Статистика и отчеты"
-    )
-    
-    await reply(message, text)
-
-@dp.message(F.text == "⚙️ Настройки организации")
-async def organization_settings(message: types.Message):
-    """Настройки организации для директора"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'director':
-        await reply(message, "⛔ Доступ только для директора!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(
-            message,
-            "🏢 <b>У вас нет организации</b>\n\n"
-            "Создайте организацию через меню."
-        )
-        return
-    
-    org = await db.get_organization(org_id)
-    if not org:
-        await reply(message, "❌ Организация не найдена!")
-        return
-    
+    # Создаем клавиатуру для уточнения
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Изменить название", callback_data=f"edit_org_name:{org_id}")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data=f"org_stats:{org_id}")],
-            [InlineKeyboardButton(text="📋 Журнал действий", callback_data=f"org_logs:{org_id}")],
+            [InlineKeyboardButton(text="❓ Уточнить вопрос", callback_data="ai_clarify")],
+            [InlineKeyboardButton(text="✅ Ответ помог", callback_data="ai_helpful")],
+            [InlineKeyboardButton(text="❌ Ответ не помог", callback_data="ai_not_helpful")],
         ]
     )
     
     await reply(
         message,
-        f"⚙️ <b>Настройки организации</b>\n\n"
-        f"<b>Название:</b> {org['name']}\n"
-        f"<b>ID:</b> {org_id}\n"
-        f"<b>Создана:</b> {org['created_at'][:10]}\n\n"
-        f"Выберите действие:",
+        f"❓ <b>Ваш вопрос:</b>\n{question}\n\n"
+        f"🤖 <b>Ответ ИИ-помощника:</b>\n{answer}\n\n"
+        f"<i>Этот ответ был полезен?</i>",
         reply_markup=keyboard
     )
-
-# ========== ОБРАБОТЧИКИ CALLBACK ==========
-
-@dp.callback_query(F.data.startswith("edit_org_name:"))
-async def edit_org_name_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка запроса на изменение названия организации"""
-    org_id = int(callback.data.split(":")[1])
     
-    # Проверяем права
+    await state.update_data(last_question=question, last_answer=answer)
+    await state.set_state(UserStates.waiting_for_ai_followup)
+ 
+@dp.callback_query(F.data == "ai_clarify", UserStates.waiting_for_ai_followup)
+async def ai_clarify_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает запрос на уточнение"""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    
+    await reply(
+        callback.message,
+        "❓ <b>Уточните ваш вопрос:</b>\n\n"
+        "Опишите более подробно или задайте уточняющий вопрос:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_ai_question)
+    await callback.answer()
+ 
+@dp.callback_query(F.data == "ai_helpful", UserStates.waiting_for_ai_followup)
+async def ai_helpful_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает положительную оценку ответа"""
+    data = await state.get_data()
+    question = data.get('last_question', '')
+    answer = data.get('last_answer', '')
+    
     user = await db.get_user(callback.from_user.id)
-    if user['role'] != 'director' or user.get('organization_id') != org_id:
-        await callback.answer("⛔ У вас нет прав для этого действия!", show_alert=True)
-        return
+    if user and user.get('organization_id'):
+        # Сохраняем как полезный ответ
+        await db.add_ai_context(
+            organization_id=user['organization_id'],
+            context_type="helpful_answer",
+            equipment_model="",
+            question=question,
+            answer=answer,
+            source="user_feedback"
+        )
     
     await callback.message.edit_text(
-        f"✏️ <b>Изменение названия организации</b>\n\n"
-        f"Введите новое название:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_edit:{org_id}")]
-            ]
-        )
+        f"{callback.message.text}\n\n"
+        f"✅ <b>Спасибо за обратную связь!</b>\n"
+        f"Это поможет улучшить ИИ-помощника.",
+        reply_markup=None
     )
     
-    await state.update_data(org_id=org_id)
-    await state.set_state(UserStates.waiting_for_edit_org_name)
-    await callback.answer()
-
-@dp.message(UserStates.waiting_for_edit_org_name)
-async def process_edit_org_name(message: types.Message, state: FSMContext):
-    """Обрабатывает новое название организации"""
-    data = await state.get_data()
-    org_id = data.get('org_id')
-    
-    if not org_id:
-        await state.clear()
-        await cmd_start(message, state)
-        return
-    
-    new_name = message.text.strip()
-    
-    if len(new_name) < 2:
-        await reply(message, "❌ Название организации слишком короткое!")
-        return
-    
-    # Обновляем название
-    success = await db.update_organization_name(org_id, new_name)
-    
-    if success:
-        await log_user_action(message.from_user.id, "organization_renamed", f"New name: {new_name}")
-        
-        await reply(
-            message,
-            f"✅ <b>Название организации изменено!</b>\n\n"
-            f"<b>Новое название:</b> {new_name}"
-        )
-    else:
-        await reply(message, "❌ Ошибка при изменении названия!")
+    await state.clear()
+    await callback.answer("Спасибо за оценку!")
+ 
+@dp.callback_query(F.data == "ai_not_helpful", UserStates.waiting_for_ai_followup)
+async def ai_not_helpful_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает отрицательную оценку ответа"""
+    await callback.message.edit_text(
+        f"{callback.message.text}\n\n"
+        f"⚠️ <b>Извините, что ответ не помог.</b>\n"
+        f"Рекомендуем обратиться к начальнику парка или техническому специалисту.",
+        reply_markup=None
+    )
     
     await state.clear()
-    await cmd_start(message, state)
-
-@dp.callback_query(F.data.startswith("cancel_edit:"))
-async def cancel_edit_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Отмена редактирования"""
-    await state.clear()
-    await callback.message.edit_text("❌ Изменение названия отменено.")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("org_stats:"))
-async def org_stats_callback(callback: types.CallbackQuery):
-    """Показывает статистику организации"""
-    org_id = int(callback.data.split(":")[1])
-    
-    org = await db.get_organization(org_id)
-    if not org:
-        await callback.answer("❌ Организация не найдена!", show_alert=True)
-        return
-    
-    # Получаем статистику
-    stats = await db.get_organization_stats(org_id)
-    
-    text = f"📊 <b>Статистика организации</b>\n\n"
-    text += f"<b>Название:</b> {org['name']}\n\n"
-    
-    # Сотрудники
-    if 'roles' in stats:
-        text += "<b>👥 Сотрудники:</b>\n"
-        role_names = {
-            'director': '👨‍💼 Директор',
-            'fleetmanager': '👷 Начальник парка',
-            'driver': '🚛 Водитель'
-        }
-        for role, count in stats['roles'].items():
-            text += f"  {role_names.get(role, role)}: {count} чел.\n"
-        text += f"  <b>Всего:</b> {sum(stats['roles'].values())} чел.\n\n"
-    
-    # Техника
-    if 'equipment' in stats:
-        text += "<b>🚜 Техника:</b>\n"
-        for status, count in stats['equipment'].items():
-            status_name = {
-                'active': '✅ Активная',
-                'maintenance': '🔧 На ТО',
-                'repair': '🔨 В ремонте',
-                'inactive': '❌ Неактивная'
-            }.get(status, status)
-            text += f"  {status_name}: {count} ед.\n"
-        text += f"  <b>Всего:</b> {sum(stats['equipment'].values())} ед.\n\n"
-    
-    # Активные смены
-    text += f"<b>🔄 Активные смены:</b> {stats.get('active_shifts', 0)}\n\n"
-    
-    # Предстоящие ТО
-    text += f"<b>📅 ТО на неделю:</b> {stats.get('weekly_maintenance', 0)}\n\n"
-    
-    # Последние действия
-    recent_actions = await db.get_recent_actions(org_id, limit=5)
-    if recent_actions:
-        text += "<b>📋 Последние действия:</b>\n"
-        for action in recent_actions[:3]:
-            time = datetime.strptime(action['created_at'], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
-            user_name = action['full_name'].split()[0]
-            text += f"  {time} {user_name}: {action['action_type']}\n"
-    
-    await callback.message.edit_text(text)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("org_logs:"))
-async def org_logs_callback(callback: types.CallbackQuery):
-    """Показывает журнал действий организации"""
-    org_id = int(callback.data.split(":")[1])
-    
-    org = await db.get_organization(org_id)
-    if not org:
-        await callback.answer("❌ Организация не найдена!", show_alert=True)
-        return
-    
-    actions = await db.get_recent_actions(org_id, limit=10)
-    
-    if not actions:
-        text = f"📋 <b>Журнал действий организации</b>\n\n"
-        text += f"<b>Название:</b> {org['name']}\n\n"
-        text += "Действий пока нет."
-    else:
-        text = f"📋 <b>Журнал действий организации</b>\n\n"
-        text += f"<b>Название:</b> {org['name']}\n\n"
-        
-        for action in actions:
-            time = datetime.strptime(action['created_at'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
-            user_name = action['full_name']
-            text += f"<b>{time}</b> {user_name}\n"
-            text += f"   {action['action_type']}\n"
-            if action['details']:
-                text += f"   <i>{action['details'][:40]}...</i>\n"
-            text += "\n"
-    
-    await callback.message.edit_text(text)
-    await callback.answer()
-
-# ========== ОБРАБОТЧИКИ ДИРЕКТОРА ==========
-
-@dp.message(F.text == "🚜 Автопарк")
-async def show_equipment(message: types.Message):
-    """Показывает технику организации"""
+    await callback.answer("Извините за неудобства!")
+ 
+# ========== УЧЕТ ТОПЛИВА ==========
+ 
+@dp.message(F.text == "⛽ Учет топлива")
+async def fuel_menu(message: types.Message):
+    """Меню учета топлива"""
     user = await db.get_user(message.from_user.id)
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
+    
+    if user['role'] not in ['director', 'fleetmanager', 'driver']:
+        await reply(message, "⛔ Нет доступа к учету топлива!")
         return
     
     org_id = user.get('organization_id')
-    if not org_id:
+    if not org_id and user['role'] != 'botadmin':
         await reply(message, "❌ Вы не привязаны к организации!")
         return
     
-    equipment = await db.get_organization_equipment(org_id)
-    
-    if not equipment:
-        await reply(
-            message,
-            "🚜 <b>Автопарк</b>\n\n"
-            "Техники пока нет.\n"
-            "Добавьте технику через меню '➕ Добавить технику'."
-        )
-        return
-    
-    text = f"🚜 <b>Автопарк ({len(equipment)} ед.)</b>\n\n"
-    
-    for eq in equipment[:10]:  # Показываем первые 10 единиц
-        text += f"<b>• {eq['name']}</b>\n"
-        text += f"  Модель: {eq['model']}\n"
-        text += f"  VIN: {eq['vin']}\n"
-        text += f"  Статус: {eq['status']}\n\n"
-    
-    if len(equipment) > 10:
-        text += f"... и ещё {len(equipment) - 10} единиц"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "👥 Сотрудники")
-async def show_employees(message: types.Message):
-    """Показывает сотрудников организации"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
-        return
-    
-    users = await db.get_users_by_organization(org_id)
-    
-    if not users:
-        await reply(
-            message,
-            "👥 <b>Сотрудники</b>\n\n"
-            "Сотрудников пока нет.\n"
-            "Назначьте сотрудников через меню '➕ Назначить роль'."
-        )
-        return
-    
-    role_names = {
-        'director': '👨‍💼 Директор',
-        'fleetmanager': '👷 Начальник парка',
-        'driver': '🚛 Водитель'
-    }
-    
-    text = f"👥 <b>Сотрудники ({len(users)} чел.)</b>\n\n"
-    
-    for u in users:
-        text += f"{role_names.get(u['role'], '👤')} <b>{u['full_name']}</b>\n"
-        if u['username']:
-            text += f"@{u['username']} | "
-        text += f"ID: {u['telegram_id']}\n\n"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "➕ Добавить технику")
-async def add_equipment_start(message: types.Message, state: FSMContext):
-    """Начинает добавление техники"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
-        return
-    
-    await state.update_data(org_id=org_id)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⛽ Добавить заправку", callback_data="add_fuel")],
+            [InlineKeyboardButton(text="📊 Статистика расхода", callback_data="fuel_stats")],
+            [InlineKeyboardButton(text="📋 История заправок", callback_data="fuel_history")],
+            [InlineKeyboardButton(text="⚠️ Низкий уровень", callback_data="low_fuel")],
+        ]
+    )
     
     await reply(
         message,
-        "🚜 <b>Добавление техника</b>\n\n"
-        "Введите название техники:",
-        reply_markup=get_cancel_keyboard()
+        "⛽ <b>Учет топлива</b>\n\n"
+        "Управление заправками и мониторинг расхода топлива.",
+        reply_markup=keyboard
     )
-    await state.set_state(UserStates.waiting_for_equipment_name)
-
-@dp.message(F.text == "📅 Ближайшие ТО")
-async def show_upcoming_maintenance(message: types.Message):
-    """Показывает ближайшие ТО"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
+ 
+@dp.callback_query(F.data == "add_fuel")
+async def add_fuel_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Начинает добавление заправки"""
+    user = await db.get_user(callback.from_user.id)
+    
+    if user['role'] not in ['driver', 'fleetmanager']:
+        await callback.answer("⛔ Только водители и начальники парка могут добавлять заправки!", show_alert=True)
         return
     
     org_id = user.get('organization_id')
     if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
+        await callback.answer("❌ Вы не привязаны к организации!", show_alert=True)
         return
     
-    # Получаем всю технику организации
-    equipment = await db.get_organization_equipment(org_id)
+    # Получаем технику
+    if user['role'] == 'driver':
+        equipment = await db.get_equipment_by_driver(callback.from_user.id)
+    else:
+        equipment = await db.get_organization_equipment(org_id)
     
     if not equipment:
-        await reply(message, "🚜 <b>Техники пока нет</b>")
-        return
-    
-    # Проверяем ТО для каждой техники
-    today = datetime.now().date()
-    upcoming_maintenance = []
-    
-    for eq in equipment:
-        if eq.get('next_maintenance'):
-            next_date = datetime.strptime(eq['next_maintenance'], '%Y-%m-%d').date()
-            days_left = (next_date - today).days
-            
-            if days_left <= 30:  # Показываем только ТО в ближайшие 30 дней
-                upcoming_maintenance.append({
-                    'equipment': eq,
-                    'next_date': next_date,
-                    'days_left': days_left
-                })
-    
-    if not upcoming_maintenance:
-        await reply(
-            message,
-            "📅 <b>Ближайшие ТО</b>\n\n"
-            "Нет предстоящих ТО в ближайшие 30 дней.\n"
-            "Все ТО запланированы на более поздние даты."
+        await callback.message.edit_text(
+            "🚜 <b>Нет доступной техники</b>\n\n"
+            "Сначала добавьте технику в организацию."
         )
-        return
-    
-    # Сортируем по дате
-    upcoming_maintenance.sort(key=lambda x: x['days_left'])
-    
-    text = "📅 <b>Ближайшие ТО</b>\n\n"
-    
-    for item in upcoming_maintenance[:10]:  # Показываем первые 10
-        eq = item['equipment']
-        days_left = item['days_left']
-        
-        if days_left < 0:
-            status = f"🔴 <b>Просрочено на {abs(days_left)} дней!</b>"
-        elif days_left == 0:
-            status = "🟡 <b>Сегодня!</b>"
-        elif days_left <= 7:
-            status = f"🟠 <b>Через {days_left} дней</b>"
-        else:
-            status = f"🟢 Через {days_left} дней"
-        
-        text += f"🚜 <b>{eq['name']}</b> ({eq['model']})\n"
-        text += f"📅 {item['next_date'].strftime('%d.%m.%Y')}\n"
-        text += f"📌 {status}\n"
-        text += f"🆔 VIN: {eq['vin']}\n\n"
-    
-    if len(upcoming_maintenance) > 10:
-        text += f"... и ещё {len(upcoming_maintenance) - 10} ТО\n"
-    
-    text += "\n<i>Для добавления ТО используйте меню '➕ Добавить ТО'</i>"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "🔍 Проверить осмотры")
-async def check_inspections(message: types.Message):
-    """Показывает смены ожидающие проверки"""
-    user = await db.get_user(message.from_user.id)
-    
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
-        return
-    
-    pending_shifts = await db.get_pending_inspections(org_id)
-    
-    if not pending_shifts:
-        await reply(
-            message,
-            "🔍 <b>Проверка осмотров</b>\n\n"
-            "Нет смен ожидающих проверки.\n"
-            "Все осмотры подтверждены! ✅"
-        )
-        return
-    
-    text = f"🔍 <b>Смены ожидающие проверки</b> ({len(pending_shifts)})\n\n"
-    
-    for shift in pending_shifts[:5]:  # Показываем первые 5
-        text += f"🆔 <b>Смена #{shift['id']}</b>\n"
-        text += f"🚛 <b>Водитель:</b> {shift['driver_name']}\n"
-        text += f"🚜 <b>Техника:</b> {shift['equipment_name']}\n"
-        text += f"🕐 <b>Начало:</b> {shift['start_time'][:16]}\n\n"
-        
-        # Добавляем inline кнопки для проверки
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="✅ Подтвердить",
-                        callback_data=f"approve_inspection:{shift['id']}"
-                    ),
-                    InlineKeyboardButton(
-                        text="❌ Отклонить", 
-                        callback_data=f"reject_inspection:{shift['id']}"
-                    )
-                ]
-            ]
-        )
-        
-        await message.answer(text, reply_markup=keyboard)
-        text = ""
-    
-    if len(pending_shifts) > 5:
-        await reply(message, f"... и ещё {len(pending_shifts) - 5} смен")
-
-# ========== РАСШИРЕННОЕ УПРАВЛЕНИЕ ТЕХНИКОЙ ==========
-
-@dp.message(F.text == "✏️ Редактировать технику")
-async def edit_equipment_start(message: types.Message, state: FSMContext):
-    """Начинает процесс редактирования техники"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
-        return
-    
-    # Получаем технику организации
-    equipment = await db.get_organization_equipment(org_id)
-    
-    if not equipment:
-        await reply(message, "🚜 <b>Техники пока нет</b>")
+        await callback.answer()
         return
     
     # Создаем клавиатуру с техникой
     keyboard = []
     for eq in equipment[:10]:
-        keyboard.append([types.KeyboardButton(text=f"✏️ {eq['name']} ({eq['model']})")])
-    keyboard.append([types.KeyboardButton(text="❌ Отмена")])
-    
-    await state.update_data(equipment_list=equipment, org_id=org_id)
-    
-    await reply(
-        message,
-        "✏️ <b>Редактирование техники</b>\n\n"
-        "Выберите технику для редактирования:",
-        reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-    )
-    await state.set_state(UserStates.waiting_for_equipment_selection)
-
-@dp.message(F.text.startswith("✏️ "), UserStates.waiting_for_equipment_selection)
-async def process_edit_equipment_selection(message: types.Message, state: FSMContext):
-    """Обрабатывает выбор техники для редактирования"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Редактирование отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    data = await state.get_data()
-    equipment_list = data.get('equipment_list', [])
-    
-    # Ищем выбранную технику
-    selected_eq = None
-    for eq in equipment_list:
-        if f"✏️ {eq['name']} ({eq['model']})" == message.text:
-            selected_eq = eq
-            break
-    
-    if not selected_eq:
-        await reply(message, "❌ Пожалуйста, выберите технику из списка")
-        return
-    
-    await state.update_data(selected_equipment=selected_eq)
-    
-    # Предлагаем что редактировать
-    keyboard = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="📝 Изменить название")],
-            [types.KeyboardButton(text="📝 Изменить модель")],
-            [types.KeyboardButton(text="🔧 Изменить статус")],
-            [types.KeyboardButton(text="📅 Изменить дату ТО")],
-            [types.KeyboardButton(text="📝 Добавить заметки")],
-            [types.KeyboardButton(text="❌ Отмена")]
-        ],
-        resize_keyboard=True
-    )
-    
-    await reply(
-        message,
-        f"✏️ <b>Редактирование:</b> {selected_eq['name']} ({selected_eq['model']})\n\n"
-        f"<b>Текущие данные:</b>\n"
-        f"• Название: {selected_eq['name']}\n"
-        f"• Модель: {selected_eq['model']}\n"
-        f"• VIN: {selected_eq['vin']}\n"
-        f"• Статус: {selected_eq['status']}\n"
-        f"• Следующее ТО: {selected_eq.get('next_maintenance', 'Не задано')}\n\n"
-        f"Выберите что хотите изменить:",
-        reply_markup=keyboard
-    )
-    await state.set_state(UserStates.waiting_for_equipment_edit_choice)
-
-@dp.message(UserStates.waiting_for_equipment_edit_choice)
-async def process_edit_choice(message: types.Message, state: FSMContext):
-    """Обрабатывает выбор поля для редактирования"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Редактирование отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    edit_options = {
-        "📝 Изменить название": "Введите новое название техники:",
-        "📝 Изменить модель": "Введите новую модель техники:",
-        "🔧 Изменить статус": "Выберите новый статус:",
-        "📅 Изменить дату ТО": "Введите новую дату ТО (ДД.ММ.ГГГГ):",
-        "📝 Добавить заметки": "Введите заметки о технике:"
-    }
-    
-    if message.text not in edit_options:
-        await reply(message, "❌ Пожалуйста, выберите опцию из списка")
-        return
-    
-    await state.update_data(edit_field=message.text)
-    
-    if message.text == "🔧 Изменить статус":
-        # Клавиатура со статусами
-        keyboard = types.ReplyKeyboardMarkup(
-            keyboard=[
-                [types.KeyboardButton(text="✅ Активная")],
-                [types.KeyboardButton(text="🔧 На ТО")],
-                [types.KeyboardButton(text="🔨 В ремонте")],
-                [types.KeyboardButton(text="💤 Резерв")],
-                [types.KeyboardButton(text="❌ Списана")],
-                [types.KeyboardButton(text="❌ Отмена")]
-            ],
-            resize_keyboard=True
-        )
-        await reply(message, "Выберите новый статус техники:", reply_markup=keyboard)
-    else:
-        await reply(message, edit_options[message.text], reply_markup=get_cancel_keyboard())
-    
-    await state.set_state(UserStates.waiting_for_equipment_edit_value)
-
-@dp.message(UserStates.waiting_for_equipment_edit_value)
-async def process_edit_value(message: types.Message, state: FSMContext):
-    """Обрабатывает новое значение для техники"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Редактирование отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    data = await state.get_data()
-    selected_eq = data.get('selected_equipment')
-    edit_field = data.get('edit_field')
-    
-    if not selected_eq or not edit_field:
-        await state.clear()
-        await reply(message, "❌ Ошибка данных. Начните заново.")
-        return
-    
-    # Подготавливаем данные для обновления
-    update_data = {}
-    
-    if edit_field == "📝 Изменить название":
-        update_data['name'] = message.text
-    elif edit_field == "📝 Изменить модель":
-        update_data['model'] = message.text
-    elif edit_field == "🔧 Изменить статус":
-        status_map = {
-            "✅ Активная": "active",
-            "🔧 На ТО": "maintenance",
-            "🔨 В ремонте": "repair",
-            "💤 Резерв": "reserve",
-            "❌ Списана": "inactive"
-        }
-        update_data['status'] = status_map.get(message.text, "active")
-    elif edit_field == "📅 Изменить дату ТО":
-        try:
-            # Проверяем формат даты
-            datetime.strptime(message.text, "%d.%m.%Y")
-            update_data['next_maintenance'] = datetime.strptime(message.text, "%d.%m.%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            await reply(message, "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ")
-            return
-    elif edit_field == "📝 Добавить заметки":
-        update_data['notes'] = message.text
-    
-    # Обновляем технику в БД
-    success = await db.update_equipment(selected_eq['id'], **update_data)
-    
-    if success:
-        await reply(
-            message,
-            f"✅ <b>Техника успешно обновлена!</b>\n\n"
-            f"<b>Изменено:</b> {edit_field}\n"
-            f"<b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n"
-            f"<b>Новое значение:</b> {message.text}"
-        )
-    else:
-        await reply(message, "❌ Ошибка при обновлении техники!")
-    
-    await state.clear()
-    user = await db.get_user(message.from_user.id)
-    await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-
-# ========== ОБРАБОТЧИКИ НАЧАЛЬНИКА ПАРКА ==========
-
-@dp.message(F.text == "👷 Управление парком")
-async def fleetmanager_panel(message: types.Message):
-    """Панель начальника парка"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'fleetmanager':
-        await reply(message, "⛔ Доступ только для начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации! Обратитесь к директору.")
-        return
-    
-    org = await db.get_organization(org_id)
-    users = await db.get_users_by_organization(org_id)
-    equipment = await db.get_organization_equipment(org_id)
-    
-    drivers = len([u for u in users if u['role'] == 'driver'])
-    
-    await reply(
-        message,
-        f"👷 <b>Управление парком</b>\n\n"
-        f"<b>Организация:</b> {org['name']}\n"
-        f"<b>Водителей:</b> {drivers}\n"
-        f"<b>Техники:</b> {len(equipment)} ед.\n\n"
-        "<b>Доступные действия:</b>\n"
-        "• Просмотр техники\n"
-        "• Добавление техники\n"
-        "• Просмотр водителей\n"
-        "• Назначение водителей"
-    )
-
-@dp.message(F.text == "🚜 Техника")
-async def show_equipment_fleetmanager(message: types.Message):
-    """Показывает технику для начальника парка"""
-    await show_equipment(message)  # Используем тот же обработчик
-
-@dp.message(F.text == "👥 Водители")
-async def show_drivers(message: types.Message):
-    """Показывает водители для начальника парка"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] != 'fleetmanager':
-        await reply(message, "⛔ Доступ только для начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
-        return
-    
-    users = await db.get_users_by_organization(org_id)
-    drivers = [u for u in users if u['role'] == 'driver']
-    
-    if not drivers:
-        await reply(
-            message,
-            "👥 <b>Водители</b>\n\n"
-            "Водителей пока нет.\n"
-            "Назначьте водителей через меню '➕ Назначить водителя'."
-        )
-        return
-    
-    text = f"👥 <b>Водители ({len(drivers)} чел.)</b>\n\n"
-    
-    for d in drivers:
-        text += f"🚛 <b>{d['full_name']}</b>\n"
-        if d['username']:
-            text += f"@{d['username']} | "
-        text += f"ID: {d['telegram_id']}\n\n"
-    
-    await reply(message, text)
-
-# ========== СИСТЕМА ТО (ТЕХНИЧЕСКОГО ОБСЛУЖИВАНИЯ) ==========
-
-@dp.message(F.text == "➕ Добавить ТО")
-async def add_maintenance_start(message: types.Message, state: FSMContext):
-    """Начинает добавление ТО"""
-    user = await db.get_user(message.from_user.id)
-    if user['role'] not in ['director', 'fleetmanager']:
-        await reply(message, "⛔ Доступ только для директора или начальника парка!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации!")
-        return
-    
-    # Получаем технику организации
-    equipment = await db.get_organization_equipment(org_id)
-    
-    if not equipment:
-        await reply(
-            message,
-            "🚜 <b>Добавление ТО</b>\n\n"
-            "Сначала добавьте технику в организацию."
-        )
-        return
-    
-    # Создаем клавиатуру с техникой
-    keyboard = []
-    for eq in equipment[:10]:  # Показываем первые 10 единиц
         keyboard.append([types.KeyboardButton(text=f"🚜 {eq['name']} ({eq['model']})")])
     keyboard.append([types.KeyboardButton(text="❌ Отмена")])
     
     await state.update_data(equipment_list=equipment, org_id=org_id)
     
+    await callback.message.edit_text(
+        "⛽ <b>Добавление заправки</b>\n\n"
+        "Выберите технику:",
+        reply_markup=None
+    )
+    
     await reply(
-        message,
-        "🔧 <b>Добавление ТО</b>\n\n"
-        "Выберите технику для добавления ТО:",
+        callback.message,
+        "Выберите технику для заправки:",
         reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     )
-    await state.set_state(UserStates.waiting_for_equipment_selection)
-
-@dp.message(UserStates.waiting_for_equipment_selection)
-async def process_maintenance_equipment_selection(message: types.Message, state: FSMContext):
-    """Обрабатывает выбор техники для ТО"""
+    await state.set_state(UserStates.waiting_for_fuel_equipment)
+    await callback.answer()
+ 
+@dp.message(UserStates.waiting_for_fuel_equipment)
+async def process_fuel_equipment(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор техники для заправки"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Добавление ТО отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
         return
     
     data = await state.get_data()
     equipment_list = data.get('equipment_list', [])
     
-    # Ищем выбранную технику
     selected_eq = None
     for eq in equipment_list:
         if f"🚜 {eq['name']} ({eq['model']})" == message.text:
@@ -1689,191 +721,1133 @@ async def process_maintenance_equipment_selection(message: types.Message, state:
         await reply(message, "❌ Пожалуйста, выберите технику из списка")
         return
     
-    # Сохраняем выбранную технику
     await state.update_data(selected_equipment=selected_eq)
     
-    # Типы ТО
-    maintenance_types = [
-        "🛢️ Замена масла",
-        "🔧 ТО-1000 (первое)",
-        "🔧 ТО-5000 (плановое)",
-        "🔧 ТО-10000 (комплексное)",
-        "🔩 Замена фильтров",
-        "🛞 Регламент шин",
-        "⚡ Электрика",
-        "🔧 Прочее"
-    ]
-    
-    keyboard = []
-    for mt in maintenance_types:
-        keyboard.append([types.KeyboardButton(text=mt)])
-    keyboard.append([types.KeyboardButton(text="❌ Отмена")])
-    
     await reply(
         message,
-        f"🔧 <b>Добавление ТО для:</b> {selected_eq['name']} ({selected_eq['model']})\n\n"
-        f"Выберите тип ТО:",
-        reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-    )
-    await state.set_state(UserStates.waiting_for_maintenance_type)
-
-@dp.message(UserStates.waiting_for_maintenance_type)
-async def process_maintenance_type(message: types.Message, state: FSMContext):
-    """Обрабатывает тип ТО"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Добавление ТО отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    maintenance_types = [
-        "🛢️ Замена масла",
-        "🔧 ТО-1000 (первое)",
-        "🔧 ТО-5000 (плановое)",
-        "🔧 ТО-10000 (комплексное)",
-        "🔩 Замена фильтров",
-        "🛞 Регламент шин",
-        "⚡ Электрика",
-        "🔧 Прочее"
-    ]
-    
-    if message.text not in maintenance_types:
-        await reply(message, "❌ Пожалуйста, выберите тип ТО из списка")
-        return
-    
-    await state.update_data(maintenance_type=message.text)
-    
-    await reply(
-        message,
-        f"✅ <b>Тип ТО:</b> {message.text}\n\n"
-        f"Введите дату ТО в формате ДД.ММ.ГГГГ:\n\n"
-        f"<b>Пример:</b> 15.01.2024\n"
-        f"Или укажите через сколько дней:\n"
-        f"<b>Пример:</b> через 30 дней",
+        f"✅ <b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n\n"
+        f"Введите количество топлива в литрах:",
         reply_markup=get_cancel_keyboard()
     )
-    await state.set_state(UserStates.waiting_for_maintenance_date)
-
-@dp.message(UserStates.waiting_for_maintenance_date)
-async def process_maintenance_date(message: types.Message, state: FSMContext):
-    """Обрабатывает дату ТО"""
+    await state.set_state(UserStates.waiting_for_fuel_amount)
+ 
+@dp.message(UserStates.waiting_for_fuel_amount)
+async def process_fuel_amount(message: types.Message, state: FSMContext):
+    """Обрабатывает количество топлива"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Добавление ТО отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
         return
     
-    date_input = message.text.strip()
-    
     try:
-        if date_input.startswith("через "):
-            # Формат "через X дней"
-            days = int(date_input.split()[1])
-            maintenance_date = (datetime.now() + timedelta(days=days)).date()
-        else:
-            # Формат ДД.ММ.ГГГГ
-            maintenance_date = datetime.strptime(date_input, "%d.%m.%Y").date()
-        
-        # Проверяем что дата не в прошлом
-        if maintenance_date < datetime.now().date():
-            await reply(message, "❌ Дата ТО не может быть в прошлом!")
+        fuel_amount = float(message.text.replace(',', '.'))
+        if fuel_amount <= 0 or fuel_amount > 1000:
+            await reply(message, "❌ Некорректное количество! Введите от 0.1 до 1000 литров")
             return
-        
-        await state.update_data(maintenance_date=maintenance_date.strftime("%Y-%m-%d"))
-        
-        await reply(
-            message,
-            f"✅ <b>Дата ТО:</b> {maintenance_date.strftime('%d.%m.%Y')}\n\n"
-            f"Введите описание ТО (можно пропустить, отправив любое сообщение):",
-            reply_markup=types.ReplyKeyboardMarkup(
-                keyboard=[[types.KeyboardButton(text="⏭️ Без описания")], [types.KeyboardButton(text="❌ Отмена")]],
-                resize_keyboard=True
-            )
-        )
-        await state.set_state(UserStates.waiting_for_maintenance_description)
-        
     except ValueError:
-        await reply(message, "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ или 'через X дней'")
-
-@dp.message(UserStates.waiting_for_maintenance_description)
-async def process_maintenance_description(message: types.Message, state: FSMContext):
-    """Обрабатывает описание ТО"""
+        await reply(message, "❌ Введите число! Например: 50.5")
+        return
+    
+    await state.update_data(fuel_amount=fuel_amount)
+    
+    await reply(
+        message,
+        f"✅ <b>Количество:</b> {fuel_amount} л\n\n"
+        f"Выберите тип топлива:",
+        reply_markup=get_fuel_type_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_fuel_cost)
+ 
+@dp.message(UserStates.waiting_for_fuel_cost)
+async def process_fuel_type(message: types.Message, state: FSMContext):
+    """Обрабатывает тип топлива и стоимость"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Добавление ТО отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    valid_fuels = ["⛽ Дизель ДТ", "⛽ Бензин АИ-92", "⛽ Бензин АИ-95", "⚡ Электричество"]
+    if message.text not in valid_fuels:
+        await reply(message, "❌ Выберите тип топлива из списка")
+        return
+    
+    fuel_type = message.text.replace('⛽ ', '').replace('⚡ ', '')
+    
+    await state.update_data(fuel_type=fuel_type)
+    
+    await reply(
+        message,
+        f"✅ <b>Тип топлива:</b> {fuel_type}\n\n"
+        f"Введите цену за литр (руб.):\n"
+        f"<i>Например: 55.30</i>",
+        reply_markup=get_cancel_keyboard()
+    )
+ 
+@dp.message(UserStates.waiting_for_fuel_cost)
+async def process_fuel_cost(message: types.Message, state: FSMContext):
+    """Обрабатывает стоимость топлива"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    try:
+        cost_per_liter = float(message.text.replace(',', '.'))
+        if cost_per_liter <= 0 or cost_per_liter > 200:
+            await reply(message, "❌ Некорректная цена! Введите от 1 до 200 руб.")
+            return
+    except ValueError:
+        await reply(message, "❌ Введите число! Например: 55.30")
         return
     
     data = await state.get_data()
+    fuel_amount = data.get('fuel_amount', 0)
+    total_cost = round(fuel_amount * cost_per_liter, 2)
+    
+    await state.update_data(cost_per_liter=cost_per_liter, total_cost=total_cost)
+    
+    await reply(
+        message,
+        f"✅ <b>Цена за литр:</b> {cost_per_liter} руб.\n"
+        f"✅ <b>Общая стоимость:</b> {total_cost} руб.\n\n"
+        f"Введите показания одометра (км):\n"
+        f"<i>Необязательно, можно пропустить</i>",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="⏭️ Пропустить")], [types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(UserStates.waiting_for_fuel_odometer)
+ 
+@dp.message(UserStates.waiting_for_fuel_odometer)
+async def process_fuel_odometer(message: types.Message, state: FSMContext):
+    """Обрабатывает показания одометра"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    odometer_reading = None
+    if message.text != "⏭️ Пропустить":
+        try:
+            odometer_reading = int(message.text)
+            if odometer_reading < 0 or odometer_reading > 1000000:
+                await reply(message, "❌ Некорректные показания! Введите от 0 до 1,000,000 км")
+                return
+        except ValueError:
+            await reply(message, "❌ Введите целое число! Например: 12500")
+            return
+    
+    await state.update_data(odometer_reading=odometer_reading)
+    
+    await reply(
+        message,
+        "📸 <b>Прикрепите фото чека</b> (необязательно):\n\n"
+        "Отправьте фото или нажмите 'Пропустить':",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="📸 Сделать фото")], 
+                     [types.KeyboardButton(text="⏭️ Пропустить")],
+                     [types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(UserStates.waiting_for_fuel_photo)
+ 
+@dp.message(UserStates.waiting_for_fuel_photo)
+async def process_fuel_photo_prompt(message: types.Message, state: FSMContext):
+    """Обрабатывает запрос на фото"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    if message.text == "⏭️ Пропустить":
+        await state.update_data(receipt_photo=None)
+        await reply(
+            message,
+            "📝 <b>Добавьте заметки</b> (необязательно):\n\n"
+            "Например: 'Заправка на АЗС Лукойл, смена 2'",
+            reply_markup=types.ReplyKeyboardMarkup(
+                keyboard=[[types.KeyboardButton(text="⏭️ Без заметок")], 
+                         [types.KeyboardButton(text="❌ Отмена")]],
+                resize_keyboard=True
+            )
+        )
+        await state.set_state(UserStates.waiting_for_fuel_notes)
+        return
+    
+    if message.text == "📸 Сделать фото":
+        await reply(
+            message,
+            "📸 <b>Сделайте фото чека и отправьте его</b>\n\n"
+            "Убедитесь, что на фото видно:\n"
+            "• Название АЗС\n"
+            "• Дата и время\n"
+            "• Количество топлива\n"
+            "• Сумма",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    await reply(message, "❌ Пожалуйста, отправьте фото или выберите действие")
+ 
+@dp.message(F.photo, UserStates.waiting_for_fuel_photo)
+async def handle_fuel_photo(message: types.Message, state: FSMContext):
+    """Обрабатывает фото чека"""
+    photo_file_id = message.photo[-1].file_id
+    await state.update_data(receipt_photo=photo_file_id)
+    
+    await reply(
+        message,
+        "✅ <b>Фото чека принято!</b>\n\n"
+        "📝 <b>Добавьте заметки</b> (необязательно):\n\n"
+        "Например: 'Заправка на АЗС Лукойл, смена 2'",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="⏭️ Без заметок")], 
+                     [types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(UserStates.waiting_for_fuel_notes)
+ 
+@dp.message(UserStates.waiting_for_fuel_notes)
+async def process_fuel_notes(message: types.Message, state: FSMContext):
+    """Обрабатывает заметки о заправке"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Добавление заправки отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    notes = None
+    if message.text != "⏭️ Без заметок":
+        notes = message.text
+    
+    data = await state.get_data()
     selected_eq = data.get('selected_equipment')
-    maintenance_type = data.get('maintenance_type')
-    maintenance_date = data.get('maintenance_date')
+    fuel_amount = data.get('fuel_amount')
+    fuel_type = data.get('fuel_type')
+    cost_per_liter = data.get('cost_per_liter')
+    total_cost = data.get('total_cost')
+    odometer_reading = data.get('odometer_reading')
+    receipt_photo = data.get('receipt_photo')
+    
+    # Добавляем запись о заправке
+    fuel_log_id = await db.add_fuel_log(
+        equipment_id=selected_eq['id'],
+        driver_id=message.from_user.id,
+        fuel_amount=fuel_amount,
+        fuel_type=fuel_type,
+        cost_per_liter=cost_per_liter,
+        total_cost=total_cost,
+        odometer_reading=odometer_reading,
+        receipt_photo=receipt_photo,
+        notes=notes
+    )
+    
+    if fuel_log_id:
+        # Получаем обновленные данные о технике
+        equipment = await db.get_equipment_by_id(selected_eq['id'])
+        
+        response_text = f"✅ <b>Заправка добавлена успешно!</b>\n\n"
+        response_text += f"<b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n"
+        response_text += f"<b>Топливо:</b> {fuel_amount} л ({fuel_type})\n"
+        response_text += f"<b>Стоимость:</b> {total_cost} руб. ({cost_per_liter} руб./л)\n"
+        
+        if equipment and equipment.get('fuel_capacity'):
+            fuel_percentage = round((equipment['current_fuel_level'] / equipment['fuel_capacity']) * 100, 1)
+            response_text += f"<b>Текущий уровень:</b> {equipment['current_fuel_level']} л ({fuel_percentage}%)\n"
+        
+        if odometer_reading:
+            response_text += f"<b>Одометр:</b> {odometer_reading} км\n"
+        
+        if notes:
+            response_text += f"<b>Заметки:</b> {notes}\n"
+        
+        response_text += f"\n<code>ID заправки: #{fuel_log_id}</code>"
+        
+        # Отправляем уведомление начальнику парка
+        await notify_manager_about_fueling(
+            message.from_user.id, 
+            selected_eq['id'], 
+            fuel_amount, 
+            total_cost,
+            fuel_log_id
+        )
+        
+    else:
+        response_text = "❌ <b>Ошибка при добавлении заправки!</b>\n\nПопробуйте еще раз."
+    
+    await reply(message, response_text)
+    
+    await state.clear()
+    user = await db.get_user(message.from_user.id)
+    await reply(message, "Возврат в главное меню", 
+               reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+ 
+async def notify_manager_about_fueling(driver_id, equipment_id, fuel_amount, total_cost, fuel_log_id):
+    """Уведомляет начальника парка о заправке"""
+    try:
+        driver = await db.get_user(driver_id)
+        if not driver or not driver.get('organization_id'):
+            return
+        
+        users = await db.get_users_by_organization(driver['organization_id'])
+        fleet_managers = [u for u in users if u['role'] == 'fleetmanager']
+        
+        equipment = await db.get_equipment_by_id(equipment_id)
+        if not equipment:
+            return
+        
+        for manager in fleet_managers:
+            try:
+                await send_to_user(
+                    manager['telegram_id'],
+                    f"⛽ <b>Новая заправка</b>\n\n"
+                    f"🚛 <b>Водитель:</b> {driver['full_name']}\n"
+                    f"🚜 <b>Техника:</b> {equipment['name']} ({equipment['model']})\n"
+                    f"⛽ <b>Топливо:</b> {fuel_amount} л\n"
+                    f"💰 <b>Стоимость:</b> {total_cost} руб.\n"
+                    f"🆔 <b>ID:</b> #{fuel_log_id}\n"
+                    f"🕐 <b>Время:</b> {datetime.now().strftime('%H:%M %d.%m.%Y')}"
+                )
+            except:
+                continue
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомления о заправке: {e}")
+ 
+@dp.callback_query(F.data == "fuel_stats")
+async def fuel_stats_callback(callback: types.CallbackQuery):
+    """Показывает статистику расхода топлива"""
+    user = await db.get_user(callback.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await callback.answer("⛔ Доступ только для директора и начальника парка!", show_alert=True)
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await callback.answer("❌ Вы не привязаны к организации!", show_alert=True)
+        return
+    
+    equipment = await db.get_organization_equipment(org_id)
+    
+    if not equipment:
+        await callback.message.edit_text(
+            "🚜 <b>Нет техники</b>\n\n"
+            "Сначала добавьте технику в организацию."
+        )
+        await callback.answer()
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🚜 {eq['name'][:20]}", callback_data=f"fuel_stats_eq:{eq['id']}")]
+            for eq in equipment[:10]
+        ]
+    )
+    
+    await callback.message.edit_text(
+        "📊 <b>Статистика расхода топлива</b>\n\n"
+        "Выберите технику для просмотра статистики:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+ 
+@dp.callback_query(F.data.startswith("fuel_stats_eq:"))
+async def fuel_stats_equipment_callback(callback: types.CallbackQuery):
+    """Показывает статистику по конкретной технике"""
+    equipment_id = int(callback.data.split(":")[1])
+    
+    equipment = await db.get_equipment_by_id(equipment_id)
+    if not equipment:
+        await callback.answer("❌ Техника не найдена!", show_alert=True)
+        return
+    
+    # Получаем статистику за 30 дней
+    stats = await db.get_fuel_statistics(equipment_id, 30)
+    
+    text = f"📊 <b>Статистика расхода</b>\n\n"
+    text += f"🚜 <b>Техника:</b> {equipment['name']} ({equipment['model']})\n\n"
+    
+    if stats.get('total_fuel'):
+        text += f"<b>📅 За 30 дней:</b>\n"
+        text += f"• Всего топлива: {stats['total_fuel']} л\n"
+        text += f"• Общая стоимость: {stats.get('total_cost', 0)} руб.\n"
+        text += f"• Средняя цена: {stats.get('avg_price', 0)} руб./л\n"
+        
+        if stats.get('avg_consumption'):
+            text += f"• Средний расход: {stats['avg_consumption']} л/100км\n"
+            text += f"• Пройдено: {stats.get('km_traveled', 0)} км\n"
+        
+        text += f"\n<b>Текущий уровень:</b> {equipment.get('current_fuel_level', 0)} л"
+        
+        if equipment.get('fuel_capacity'):
+            percentage = round((equipment['current_fuel_level'] / equipment['fuel_capacity']) * 100, 1)
+            text += f" ({percentage}%)\n"
+            if percentage < 20:
+                text += f"⚠️ <b>Низкий уровень топлива!</b>\n"
+        text += f"\n<b>Одометр:</b> {equipment.get('odometer', 0)} км\n"
+    else:
+        text += "📊 <b>Нет данных о заправках за последние 30 дней</b>"
+    
+    await callback.message.edit_text(text)
+    await callback.answer()
+ 
+@dp.callback_query(F.data == "fuel_history")
+async def fuel_history_callback(callback: types.CallbackQuery):
+    """Показывает историю заправок"""
+    user = await db.get_user(callback.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await callback.answer("⛔ Доступ только для директора и начальника парка!", show_alert=True)
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await callback.answer("❌ Вы не привязаны к организации!", show_alert=True)
+        return
+    
+    # Получаем последние 10 заправок
+    fuel_logs = await db.get_fuel_logs(days=30)
+    org_equipment = await db.get_organization_equipment(org_id)
+    org_equipment_ids = [eq['id'] for eq in org_equipment]
+    
+    org_fuel_logs = [log for log in fuel_logs if log['equipment_id'] in org_equipment_ids]
+    
+    if not org_fuel_logs:
+        await callback.message.edit_text(
+            "📋 <b>История заправок</b>\n\n"
+            "За последние 30 дней заправок не было."
+        )
+        await callback.answer()
+        return
+    
+    text = "📋 <b>История заправок (последние 10)</b>\n\n"
+    
+    for log in org_fuel_logs[:10]:
+        date = datetime.strptime(log['fueling_date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
+        text += f"<b>{date}</b>\n"
+        text += f"🚜 {log.get('equipment_name', 'Техника')}\n"
+        text += f"⛽ {log['fuel_amount']} л ({log['fuel_type']})\n"
+        text += f"💰 {log.get('total_cost', 0)} руб.\n"
+        
+        if log.get('driver_name'):
+            text += f"👤 {log['driver_name']}\n"
+        
+        text += f"🆔 #{log['id']}\n\n"
+    
+    await callback.message.edit_text(text)
+    await callback.answer()
+ 
+@dp.callback_query(F.data == "low_fuel")
+async def low_fuel_callback(callback: types.CallbackQuery):
+    """Показывает технику с низким уровнем топлива"""
+    user = await db.get_user(callback.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await callback.answer("⛔ Доступ только для директора и начальника парка!", show_alert=True)
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await callback.answer("❌ Вы не привязаны к организации!", show_alert=True)
+        return
+    
+    low_fuel_equipment = await db.get_low_fuel_equipment(org_id, 20.0)
+    
+    if not low_fuel_equipment:
+        await callback.message.edit_text(
+            "⚠️ <b>Низкий уровень топлива</b>\n\n"
+            "✅ Вся техника имеет достаточный уровень топлива (>20%)."
+        )
+        await callback.answer()
+        return
+    
+    text = "⚠️ <b>Техника с низким уровнем топлива</b>\n\n"
+    
+    for eq in low_fuel_equipment:
+        fuel_percentage = eq.get('fuel_percentage', 0)
+        text += f"🚜 <b>{eq['name']}</b> ({eq['model']})\n"
+        text += f"⛽ Уровень: {eq.get('current_fuel_level', 0)} л ({fuel_percentage}%)\n"
+        
+        if fuel_percentage < 10:
+            text += "🚨 <b>Требуется срочная заправка!</b>\n"
+        elif fuel_percentage < 20:
+            text += "⚠️ <b>Требуется заправка в ближайшее время</b>\n"
+        
+        text += "\n"
+    
+    await callback.message.edit_text(text)
+    await callback.answer()
+ 
+# ========== ЗАПЧАСТИ ==========
+ 
+@dp.message(F.text == "🔧 Запчасти")
+async def spare_parts_menu(message: types.Message):
+    """Меню управления запчастями"""
+    user = await db.get_user(message.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await reply(message, "⛔ Нет доступа к управлению запчастями!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить запчасть", callback_data="add_spare_part")],
+            [InlineKeyboardButton(text="📋 Список запчастей", callback_data="list_spare_parts")],
+            [InlineKeyboardButton(text="⚠️ Низкий запас", callback_data="low_stock_parts")],
+            [InlineKeyboardButton(text="📦 Заказать запчасть", callback_data="order_part")],
+        ]
+    )
+    
+    await reply(
+        message,
+        "🔧 <b>Управление запчастями</b>\n\n"
+        "Склад запчастей и управление запасами.",
+        reply_markup=keyboard
+    )
+ 
+@dp.message(F.text == "🔧 Заказать запчасть")
+async def order_part_driver(message: types.Message, state: FSMContext):
+    """Начинает процесс заказа запчасти для водителя"""
+    user = await db.get_user(message.from_user.id)
+    
+    if user['role'] != 'driver':
+        await reply(message, "⛔ Только водители могут заказывать запчасти!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    await state.update_data(org_id=org_id, requested_by=message.from_user.id)
+    
+    await reply(
+        message,
+        "🔧 <b>Заказ запчасти</b>\n\n"
+        "Введите название запчасти, которую нужно заказать:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_part_name)
+ 
+@dp.message(UserStates.waiting_for_part_name)
+async def process_part_name(message: types.Message, state: FSMContext):
+    """Обрабатывает название запчасти"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Заказ отменен", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    part_name = message.text.strip()
+    if len(part_name) < 2:
+        await reply(message, "❌ Название слишком короткое!")
+        return
+    
+    await state.update_data(part_name=part_name)
+    
+    await reply(
+        message,
+        f"✅ <b>Запчасть:</b> {part_name}\n\n"
+        f"Введите описание или номер детали (необязательно):",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="⏭️ Без описания")], [types.KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(UserStates.waiting_for_part_details)
+ 
+@dp.message(UserStates.waiting_for_part_details)
+async def process_part_details(message: types.Message, state: FSMContext):
+    """Обрабатывает описание запчасти"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Заказ отменен", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
     
     description = None
     if message.text != "⏭️ Без описания":
         description = message.text
     
-    # Добавляем ТО в базу
+    await state.update_data(description=description)
+    
+    await reply(
+        message,
+        "🔢 <b>Введите количество:</b>",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_part_quantity)
+ 
+@dp.message(UserStates.waiting_for_part_quantity)
+async def process_part_quantity(message: types.Message, state: FSMContext):
+    """Обрабатывает количество запчастей"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Заказ отменен", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
     try:
-        maintenance_id = await db.add_maintenance(
-            equipment_id=selected_eq['id'],
-            type=maintenance_type,
-            scheduled_date=maintenance_date,
-            description=description
-        )
-        
-        # Форматируем дату для вывода
-        scheduled_date = datetime.strptime(maintenance_date, "%Y-%m-%d")
-        days_left = (scheduled_date.date() - datetime.now().date()).days
-        
+        quantity = int(message.text)
+        if quantity <= 0 or quantity > 1000:
+            await reply(message, "❌ Некорректное количество! Введите от 1 до 1000")
+            return
+    except ValueError:
+        await reply(message, "❌ Введите целое число!")
+        return
+    
+    await state.update_data(quantity=quantity)
+    
+    await reply(
+        message,
+        f"✅ <b>Количество:</b> {quantity} шт.\n\n"
+        f"Выберите срочность заказа:",
+        reply_markup=get_urgency_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_order_urgency)
+ 
+@dp.message(UserStates.waiting_for_order_urgency)
+async def process_order_urgency(message: types.Message, state: FSMContext):
+    """Обрабатывает срочность заказа"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Заказ отменен", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    urgency_map = {
+        "🚨 Срочно (сегодня)": True,
+        "⚠️ Средняя (1-3 дня)": False,
+        "📅 Не срочно (неделя)": False
+    }
+    
+    if message.text not in urgency_map:
+        await reply(message, "❌ Выберите срочность из списка")
+        return
+    
+    urgent = urgency_map[message.text]
+    
+    data = await state.get_data()
+    org_id = data.get('org_id')
+    part_name = data.get('part_name')
+    description = data.get('description')
+    quantity = data.get('quantity')
+    requested_by = data.get('requested_by')
+    
+    # Создаем заказ
+    order_id = await db.create_order(
+        organization_id=org_id,
+        order_type='parts',
+        part_name=part_name,
+        quantity=quantity,
+        urgent=urgent,
+        requested_by=requested_by,
+        notes=description
+    )
+    
+    if order_id:
         await reply(
             message,
-            f"✅ <b>ТО успешно добавлено!</b>\n\n"
-            f"<b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n"
-            f"<b>Тип ТО:</b> {maintenance_type}\n"
-            f"<b>Дата:</b> {scheduled_date.strftime('%d.%m.%Y')}\n"
-            f"<b>Осталось дней:</b> {days_left}\n"
-            f"<b>ID ТО:</b> #{maintenance_id}\n"
-            f"{f'<b>Описание:</b> {description}' if description else ''}\n\n"
-            f"Уведомление будет отправлено за неделю до ТО."
+            f"✅ <b>Заказ создан успешно!</b>\n\n"
+            f"<b>Запчасть:</b> {part_name}\n"
+            f"<b>Количество:</b> {quantity} шт.\n"
+            f"<b>Срочность:</b> {'🚨 Срочно' if urgent else '📅 Обычная'}\n"
+            f"<b>ID заказа:</b> #{order_id}\n\n"
+            f"Заказ отправлен начальнику парка на утверждение."
         )
         
-    except Exception as e:
-        logger.error(f"Ошибка при добавлении ТО: {e}")
-        await reply(
-            message,
-            f"❌ <b>Ошибка при добавлении ТО!</b>\n\n"
-            f"Попробуйте ещё раз или обратитесь к администратору."
-        )
+        # Уведомляем начальника парка
+        await notify_manager_about_order(order_id, org_id, message.from_user.id, part_name, quantity, urgent)
+    else:
+        await reply(message, "❌ Ошибка при создании заказа!")
     
     await state.clear()
     user = await db.get_user(message.from_user.id)
-    await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-
-# ========== СИСТЕМА СМЕН ВОДИТЕЛЯ ==========
-
+    await reply(message, "Возврат в главное меню", 
+               reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+ 
+async def notify_manager_about_order(order_id, org_id, requester_id, part_name, quantity, urgent):
+    """Уведомляет начальника парка о новом заказе"""
+    try:
+        requester = await db.get_user(requester_id)
+        users = await db.get_users_by_organization(org_id)
+        fleet_managers = [u for u in users if u['role'] == 'fleetmanager']
+        
+        urgency_text = "🚨 СРОЧНО" if urgent else "📅 Обычный"
+        
+        for manager in fleet_managers:
+            try:
+                keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Утвердить", callback_data=f"approve_order:{order_id}"),
+                         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_order:{order_id}")]
+                    ]
+                )
+                
+                await send_to_user(
+                    manager['telegram_id'],
+                    f"📦 <b>Новый заказ запчастей</b>\n\n"
+                    f"👤 <b>Заказал:</b> {requester['full_name']}\n"
+                    f"🔧 <b>Запчасть:</b> {part_name}\n"
+                    f"🔢 <b>Количество:</b> {quantity} шт.\n"
+                    f"⏱️ <b>Срочность:</b> {urgency_text}\n"
+                    f"🆔 <b>ID заказа:</b> #{order_id}\n\n"
+                    f"Утвердить заказ?",
+                    reply_markup=keyboard
+                )
+            except:
+                continue
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомления о заказе: {e}")
+ 
+@dp.callback_query(F.data.startswith("approve_order:"))
+async def approve_order_callback(callback: types.CallbackQuery):
+    """Утверждает заказ"""
+    order_id = int(callback.data.split(":")[1])
+    
+    success = await db.update_order_status(order_id, 'approved', callback.from_user.id)
+    
+    if success:
+        await callback.message.edit_text(
+            f"✅ <b>Заказ утвержден!</b>\n\n"
+            f"Заказ #{order_id}\n"
+            f"Утвердил: {callback.from_user.full_name}"
+        )
+        
+        # Уведомляем заказчика
+        order = await db.get_orders_by_id(order_id)
+        if order and order.get('requested_by'):
+            await send_to_user(
+                order['requested_by'],
+                f"✅ <b>Ваш заказ утвержден!</b>\n\n"
+                f"Заказ #{order_id} был утвержден начальником парка.\n"
+                f"Запчасть будет заказана в ближайшее время."
+            )
+    else:
+        await callback.answer("❌ Ошибка при утверждении заказа", show_alert=True)
+    
+    await callback.answer()
+ 
+@dp.callback_query(F.data.startswith("reject_order:"))
+async def reject_order_callback(callback: types.CallbackQuery):
+    """Отклоняет заказ"""
+    order_id = int(callback.data.split(":")[1])
+    
+    success = await db.update_order_status(order_id, 'rejected', callback.from_user.id)
+    
+    if success:
+        await callback.message.edit_text(
+            f"❌ <b>Заказ отклонен</b>\n\n"
+            f"Заказ #{order_id}\n"
+            f"Отклонил: {callback.from_user.full_name}"
+        )
+        
+        # Уведомляем заказчика
+        order = await db.get_orders_by_id(order_id)
+        if order and order.get('requested_by'):
+            await send_to_user(
+                order['requested_by'],
+                f"❌ <b>Ваш заказ отклонен</b>\n\n"
+                f"Заказ #{order_id} был отклонен начальником парка.\n"
+                f"Для уточнения причин обратитесь к начальнику парка."
+            )
+    else:
+        await callback.answer("❌ Ошибка при отклонении заказа", show_alert=True)
+    
+    await callback.answer()
+ 
+# ========== ИНСТРУКЦИИ ==========
+ 
+@dp.message(F.text == "📋 Инструкции")
+async def instructions_menu(message: types.Message):
+    """Меню инструкций"""
+    user = await db.get_user(message.from_user.id)
+    
+    if not user:
+        await reply(message, "❌ Сначала зарегистрируйтесь через /start")
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Обслуживание", callback_data="instructions:maintenance")],
+            [InlineKeyboardButton(text="⛽ Заправка", callback_data="instructions:fueling")],
+            [InlineKeyboardButton(text="🔩 Шприцевание", callback_data="instructions:greasing")],
+            [InlineKeyboardButton(text="🔍 Осмотр", callback_data="instructions:inspection")],
+            [InlineKeyboardButton(text="🔎 Поиск по модели", callback_data="instructions:search")],
+        ]
+    )
+    
+    await reply(
+        message,
+        "📋 <b>Инструкции по обслуживанию</b>\n\n"
+        "Выберите тип инструкции:",
+        reply_markup=keyboard
+    )
+ 
+@dp.callback_query(F.data.startswith("instructions:"))
+async def instructions_callback(callback: types.CallbackQuery):
+    """Показывает инструкции"""
+    instruction_type = callback.data.split(":")[1]
+    
+    if instruction_type == "search":
+        await callback.message.edit_text(
+            "🔎 <b>Поиск инструкций по модели</b>\n\n"
+            "Введите модель техники:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="instructions_cancel")]
+                ]
+            )
+        )
+        # Здесь можно реализовать поиск, но для простоты покажем пример
+        await callback.answer()
+        return
+    
+    # Примеры инструкций
+    instructions = {
+        "maintenance": (
+            "🔧 <b>Обслуживание техники</b>\n\n"
+            "1. <b>Ежедневное обслуживание:</b>\n"
+            "• Проверка уровней жидкостей\n"
+            "• Проверка давления в шинах\n"
+            "• Проверка работы фар и сигналов\n"
+            "• Осмотр на утечки\n\n"
+            "2. <b>Еженедельное обслуживание:</b>\n"
+            "• Очистка фильтров\n"
+            "• Проверка аккумулятора\n"
+            "• Смазка шарниров\n\n"
+            "3. <b>Ежемесячное обслуживание:</b>\n"
+            "• Замена масла (если требуется)\n"
+            "• Проверка тормозной системы\n"
+            "• Диагностика электросистемы"
+        ),
+        "fueling": (
+            "⛽ <b>Правила заправки</b>\n\n"
+            "1. <b>Подготовка:</b>\n"
+            "• Заглушить двигатель\n"
+            "• Выключить зажигание\n"
+            "• Не курить вблизи\n"
+            "• Использовать только разрешенное топливо\n\n"
+            "2. <b>Процесс заправки:</b>\n"
+            "• Проверить чистоту горловины\n"
+            "• Использовать чистую тару/пистолет\n"
+            "• Не переливать (оставить 5% объема)\n"
+            "• Плотно закрыть крышку\n\n"
+            "3. <b>После заправки:</b>\n"
+            "• Проверить на утечки\n"
+            "• Записать данные в журнал\n"
+            "• Прикрепить чек"
+        ),
+        "greasing": (
+            "🔩 <b>Шприцевание (смазка)</b>\n\n"
+            "1. <b>Что смазывать:</b>\n"
+            "• Шаровые опоры\n"
+            "• ШРУСы\n"
+            "• Карданные шарниры\n"
+            "• Тросы управления\n"
+            "• Подшипники\n\n"
+            "2. <b>Интервалы смазки:</b>\n"
+            "• Каждые 100 часов работы\n"
+            "• Или раз в месяц\n"
+            "• После работы в пыльных условиях\n\n"
+            "3. <b>Типы смазок:</b>\n"
+            "• Литиевая смазка - для большинства узлов\n"
+            "• Медная смазка - для высоких температур\n"
+            "• Силиконовая смазка - для резиновых деталей"
+        ),
+        "inspection": (
+            "🔍 <b>Предрейсовый осмотр</b>\n\n"
+            "1. <b>Внешний осмотр:</b>\n"
+            "• Шины (давление, износ, повреждения)\n"
+            "• Кузов (отсутствие повреждений)\n"
+            "• Стекло (чистота, трещины)\n"
+            "• Зеркала (чистота, регулировка)\n\n"
+            "2. <b>Проверка жидкостей:</b>\n"
+            "• Масло двигателя\n"
+            "• Охлаждающая жидкость\n"
+            "• Тормозная жидкость\n"
+            "• Жидкость ГУР\n"
+            "• Омыватель стекла\n\n"
+            "3. <b>Проверка оборудования:</b>\n"
+            "• Фары и сигналы\n"
+            "• Звуковой сигнал\n"
+            "• Стеклоочистители\n"
+            "• Система отопления/кондиционирования"
+        ),
+    }
+    
+    instruction_text = instructions.get(instruction_type, "Инструкция не найдена.")
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Все инструкции", callback_data="instructions_menu")],
+            [InlineKeyboardButton(text="🤖 Спросить ИИ", callback_data="ai_from_instruction")],
+        ]
+    )
+    
+    await callback.message.edit_text(
+        instruction_text,
+        reply_markup=keyboard
+    )
+    await callback.answer()
+ 
+@dp.callback_query(F.data == "ai_from_instruction")
+async def ai_from_instruction_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Переход от инструкции к ИИ"""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    
+    await reply(
+        callback.message,
+        "🤖 <b>ИИ Помощник</b>\n\n"
+        "Задайте уточняющий вопрос по инструкции:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_ai_question)
+    await callback.answer()
+ 
+# ========== АНАЛИТИКА ==========
+ 
+@dp.message(F.text == "📈 Аналитика")
+async def analytics_menu(message: types.Message, state: FSMContext):
+    """Меню аналитики"""
+    user = await db.get_user(message.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await reply(message, "⛔ Доступ только для директора и начальника парка!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    await reply(
+        message,
+        "📈 <b>Аналитика организации</b>\n\n"
+        "Выберите период для анализа:",
+        reply_markup=get_period_keyboard()
+    )
+    await state.update_data(org_id=org_id)
+    await state.set_state(UserStates.waiting_for_analytics_period)
+ 
+@dp.message(UserStates.waiting_for_analytics_period)
+async def process_analytics_period(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор периода для аналитики"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Аналитика отменена", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    period_map = {
+        "📅 За сегодня": 1,
+        "📅 За неделю": 7,
+        "📅 За месяц": 30,
+        "📅 За 3 месяца": 90,
+        "📅 За год": 365
+    }
+    
+    if message.text not in period_map:
+        await reply(message, "❌ Выберите период из списка")
+        return
+    
+    days = period_map[message.text]
+    data = await state.get_data()
+    org_id = data.get('org_id')
+    
+    # Получаем аналитику
+    analytics = await db.get_organization_analytics(org_id, days)
+    
+    text = f"📈 <b>Аналитика за {days} дней</b>\n\n"
+    
+    if analytics.get('shifts'):
+        shifts = analytics['shifts']
+        text += "<b>📊 Смены:</b>\n"
+        text += f"• Всего: {shifts.get('total_shifts', 0)}\n"
+        text += f"• Завершено: {shifts.get('completed_shifts', 0)}\n"
+        text += f"• Средняя продолжительность: {shifts.get('avg_shift_hours', 0)} ч\n\n"
+    
+    if analytics.get('fuel'):
+        fuel = analytics['fuel']
+        text += "<b>⛽ Топливо:</b>\n"
+        text += f"• Всего заправлено: {fuel.get('total_fuel', 0)} л\n"
+        text += f"• Общая стоимость: {fuel.get('total_fuel_cost', 0)} руб.\n"
+        text += f"• Средняя цена: {fuel.get('avg_fuel_price', 0)} руб./л\n\n"
+    
+    if analytics.get('maintenance'):
+        maintenance = analytics['maintenance']
+        text += "<b>🔧 Техобслуживание:</b>\n"
+        text += f"• Всего ТО: {maintenance.get('total_maintenance', 0)}\n"
+        text += f"• Выполнено: {maintenance.get('completed_maintenance', 0)}\n"
+        text += f"• Общая стоимость: {maintenance.get('total_maintenance_cost', 0)} руб.\n\n"
+    
+    if analytics.get('equipment_by_status'):
+        equipment = analytics['equipment_by_status']
+        text += "<b>🚜 Техника по статусам:</b>\n"
+        status_names = {
+            'active': '✅ Активная',
+            'maintenance': '🔧 На ТО',
+            'repair': '🔨 В ремонте',
+            'inactive': '❌ Неактивная'
+        }
+        for status, count in equipment.items():
+            text += f"• {status_names.get(status, status)}: {count} ед.\n"
+    
+    # Получаем топ-3 водителей по количеству смен
+    users = await db.get_users_by_organization(org_id)
+    drivers = [u for u in users if u['role'] == 'driver']
+    
+    driver_stats = []
+    for driver in drivers[:5]:  # Берем первых 5 для анализа
+        stats = await db.get_driver_stats(driver['telegram_id'], days)
+        if stats.get('shifts_count', 0) > 0:
+            driver_stats.append({
+                'name': driver['full_name'],
+                'shifts': stats['shifts_count'],
+                'hours': stats.get('avg_shift_hours', 0)
+            })
+    
+    if driver_stats:
+        driver_stats.sort(key=lambda x: x['shifts'], reverse=True)
+        text += f"\n<b>👥 Топ-{min(3, len(driver_stats))} водителя:</b>\n"
+        for i, driver in enumerate(driver_stats[:3]):
+            text += f"{i+1}. {driver['name']}: {driver['shifts']} смен, {driver['hours']} ч/смену\n"
+    
+    await reply(message, text)
+    
+    await state.clear()
+    user = await db.get_user(message.from_user.id)
+    await reply(message, "Возврат в главное меню", 
+               reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+ 
+# ========== ЗАКАЗЫ ==========
+ 
+@dp.message(F.text == "📦 Заказы")
+async def orders_menu(message: types.Message):
+    """Меню управления заказами"""
+    user = await db.get_user(message.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await reply(message, "⛔ Нет доступа к управлению заказами!")
+        return
+    
+    org_id = user.get('organization_id')
+    if not org_id:
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Все заказы", callback_data="list_orders")],
+            [InlineKeyboardButton(text="⏳ Ожидающие", callback_data="pending_orders")],
+            [InlineKeyboardButton(text="✅ Утвержденные", callback_data="approved_orders")],
+            [InlineKeyboardButton(text="📦 Заказанные", callback_data="ordered_orders")],
+        ]
+    )
+    
+    await reply(
+        message,
+        "📦 <b>Управление заказами</b>\n\n"
+        "Просмотр и управление заказами запчастей и топлива.",
+        reply_markup=keyboard
+    )
+ 
+@dp.callback_query(F.data == "list_orders")
+async def list_orders_callback(callback: types.CallbackQuery):
+    """Показывает все заказы"""
+    user = await db.get_user(callback.from_user.id)
+    org_id = user.get('organization_id')
+    
+    orders = await db.get_orders(org_id)
+    
+    if not orders:
+        await callback.message.edit_text(
+            "📦 <b>Заказы</b>\n\n"
+            "Заказов пока нет."
+        )
+        await callback.answer()
+        return
+    
+    text = "📦 <b>Все заказы</b>\n\n"
+    
+    for order in orders[:10]:
+        status_emoji = {
+            'pending': '⏳',
+            'approved': '✅',
+            'ordered': '📦',
+            'delivered': '🚚',
+            'cancelled': '❌'
+        }.get(order['status'], '❓')
+        
+        text += f"{status_emoji} <b>Заказ #{order['id']}</b>\n"
+        text += f"Тип: {order['order_type']}\n"
+        
+        if order.get('part_name'):
+            text += f"Запчасть: {order['part_name']}\n"
+        if order.get('equipment_name'):
+            text += f"Техника: {order['equipment_name']}\n"
+        
+        text += f"Количество: {order['quantity']}\n"
+        text += f"Статус: {order['status']}\n"
+        
+        if order.get('requested_by_name'):
+            text += f"Заказал: {order['requested_by_name']}\n"
+        
+        text += f"Дата: {order['created_at'][:10]}\n\n"
+    
+    if len(orders) > 10:
+        text += f"... и ещё {len(orders) - 10} заказов"
+    
+    await callback.message.edit_text(text)
+    await callback.answer()
+ 
+# ========== ОБНОВЛЕНИЕ СМЕНЫ С ОДОМЕТРОМ ==========
+ 
 @dp.message(F.text == "🚛 Начать смену")
 async def start_shift_begin(message: types.Message, state: FSMContext):
-    """Начинает процесс начала смены"""
+    """Начинает процесс начала смены с учетом одометра"""
     user = await db.get_user(message.from_user.id)
     
     if user['role'] != 'driver':
         await reply(message, "⛔ Только водители могут начинать смены!")
         return
     
-    # Проверяем активную смену
     active_shift = await db.get_active_shift(message.from_user.id)
     if active_shift:
         await reply(
             message,
             f"⚠️ <b>У вас уже есть активная смена!</b>\n\n"
             f"Смена начата: {active_shift['start_time'][:16]}\n"
-            f"Техника: {active_shift.get('equipment_name', 'Не указана')}\n\n"
+            f"Техника: {active_shift.get('equipment_name', 'Не указана')}\n"
+            f"Пробег: {active_shift.get('odometer', 'Не указан')} км\n\n"
             f"Завершите текущую смену перед началом новой."
         )
         return
     
-    # Получаем доступную технику
     equipment = await db.get_equipment_by_driver(message.from_user.id)
     
     if not equipment:
@@ -1885,10 +1859,8 @@ async def start_shift_begin(message: types.Message, state: FSMContext):
         )
         return
     
-    # Сохраняем список техники в состоянии
     await state.update_data(equipment_list=equipment)
     
-    # Создаем клавиатуру с техникой
     keyboard = []
     for eq in equipment:
         keyboard.append([types.KeyboardButton(text=f"🚜 {eq['name']} ({eq['model']})")])
@@ -1901,20 +1873,20 @@ async def start_shift_begin(message: types.Message, state: FSMContext):
         reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     )
     await state.set_state(UserStates.waiting_for_equipment_selection)
-
+ 
 @dp.message(UserStates.waiting_for_equipment_selection)
-async def process_equipment_selection(message: types.Message, state: FSMContext):
-    """Обрабатывает выбор техники"""
+async def process_equipment_selection_with_odometer(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор техники с запросом одометра"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Начало смены отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        await reply(message, "❌ Начало смены отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
         return
     
     data = await state.get_data()
     equipment_list = data.get('equipment_list', [])
     
-    # Ищем выбранную технику
     selected_eq = None
     for eq in equipment_list:
         if f"🚜 {eq['name']} ({eq['model']})" == message.text:
@@ -1925,12 +1897,43 @@ async def process_equipment_selection(message: types.Message, state: FSMContext)
         await reply(message, "❌ Пожалуйста, выберите технику из списка")
         return
     
-    # Сохраняем выбранную технику
     await state.update_data(selected_equipment=selected_eq)
     
     await reply(
         message,
         f"✅ <b>Выбрана техника:</b> {selected_eq['name']} ({selected_eq['model']})\n\n"
+        f"Введите показания одометра (пробег в км):",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_briefing_confirmation)
+ 
+@dp.message(UserStates.waiting_for_briefing_confirmation)
+async def process_odometer_and_briefing(message: types.Message, state: FSMContext):
+    """Обрабатывает одометр и инструктаж"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Начало смены отменено", 
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    try:
+        start_odometer = int(message.text)
+        if start_odometer < 0 or start_odometer > 1000000:
+            await reply(message, "❌ Некорректные показания! Введите от 0 до 1,000,000 км")
+            return
+    except ValueError:
+        await reply(message, "❌ Введите целое число! Например: 12500")
+        return
+    
+    await state.update_data(start_odometer=start_odometer)
+    
+    data = await state.get_data()
+    selected_eq = data.get('selected_equipment')
+    
+    await reply(
+        message,
+        f"✅ <b>Пробег:</b> {start_odometer} км\n\n"
         f"📋 <b>Технический инструктаж</b>\n\n"
         f"Перед началом смены необходимо подтвердить:\n\n"
         f"1. ✅ Знание правил техники безопасности\n"
@@ -1941,322 +1944,17 @@ async def process_equipment_selection(message: types.Message, state: FSMContext)
         reply_markup=get_yes_no_keyboard()
     )
     await state.set_state(UserStates.waiting_for_briefing_confirmation)
-
-@dp.message(UserStates.waiting_for_briefing_confirmation)
-async def process_briefing_confirmation(message: types.Message, state: FSMContext):
-    """Обрабатывает подтверждение инструктажа"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Начало смены отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    if message.text == "❌ Нет":
-        await reply(
-            message,
-            "❌ <b>Инструктаж не подтверждён</b>\n\n"
-            "Для начала смены необходимо подтвердить прохождение инструктажа.\n"
-            "Обратитесь к начальнику парка."
-        )
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    if message.text == "✅ Да":
-        data = await state.get_data()
-        selected_eq = data.get('selected_equipment')
-        
-        # Создаем смену
-        shift_id = await db.start_shift(
-            driver_id=message.from_user.id,
-            equipment_id=selected_eq['id'],
-            briefing_confirmed=True
-        )
-        
-        await state.update_data(shift_id=shift_id)
-        
-        await reply(
-            message,
-            f"✅ <b>Инструктаж подтверждён!</b>\n\n"
-            f"🚛 <b>Смена #{shift_id} начата</b>\n"
-            f"<b>Техника:</b> {selected_eq['name']} ({selected_eq['model']})\n"
-            f"<b>Время:</b> {datetime.now().strftime('%H:%M %d.%m.%Y')}\n\n"
-            f"📸 <b>Следующий шаг:</b>\n"
-            f"Сделайте фото осмотра техники перед началом работы.\n\n"
-            f"<b>Что должно быть на фото:</b>\n"
-            f"• Общий вид техники\n"
-            f"• Состояние шин\n"
-            f"• Уровни жидкостей (если видно)\n"
-            f"• Салон и приборная панель",
-            reply_markup=types.ReplyKeyboardMarkup(
-                keyboard=[[types.KeyboardButton(text="📸 Сделать фото")], [types.KeyboardButton(text="❌ Отмена")]],
-                resize_keyboard=True
-            )
-        )
-        await state.set_state(UserStates.waiting_for_inspection_photo)
-        
-        # Отправляем уведомление начальнику парка
-        await notify_manager_about_shift_start(message.from_user.id, selected_eq['id'], shift_id)
-    else:
-        await reply(message, "❌ Пожалуйста, выберите 'Да' или 'Нет'")
-
-async def notify_manager_about_shift_start(driver_id, equipment_id, shift_id):
-    """Уведомляет начальнику парка о начале смены"""
-    try:
-        # Получаем информацию о водителе
-        driver = await db.get_user(driver_id)
-        if not driver or not driver.get('organization_id'):
-            return
-        
-        # Получаем начальников парка в организации
-        users = await db.get_users_by_organization(driver['organization_id'])
-        fleet_managers = [u for u in users if u['role'] == 'fleetmanager']
-        
-        # Получаем информацию о технике
-        equipment = None
-        all_equipment = await db.get_organization_equipment(driver['organization_id'])
-        for eq in all_equipment:
-            if eq['id'] == equipment_id:
-                equipment = eq
-                break
-        
-        if not equipment:
-            return
-        
-        for manager in fleet_managers:
-            try:
-                await send_to_user(
-                    manager['telegram_id'],
-                    f"👷 <b>Новая смена начата</b>\n\n"
-                    f"🚛 <b>Водитель:</b> {driver['full_name']}\n"
-                    f"📞 <b>Контакт:</b> @{driver['username'] if driver.get('username') else 'нет'}\n"
-                    f"🚜 <b>Техника:</b> {equipment['name']} ({equipment['model']})\n"
-                    f"🆔 <b>ID смены:</b> #{shift_id}\n"
-                    f"🕐 <b>Время:</b> {datetime.now().strftime('%H:%M %d.%m.%Y')}\n\n"
-                    f"Ожидается фото осмотра техники."
-                )
-            except:
-                continue
-                
-    except Exception as e:
-        logger.error(f"Ошибка при отправке уведомления: {e}")
-
-@dp.message(UserStates.waiting_for_inspection_photo)
-async def process_inspection_photo(message: types.Message, state: FSMContext):
-    """Обрабатывает фото осмотра"""
-    if message.text == "❌ Отмена":
-        await cancel_shift(message, state)
-        return
-    
-    if message.text == "📸 Сделать фото":
-        await reply(
-            message,
-            "📸 <b>Сделайте фото осмотра техники</b>\n\n"
-            "Пожалуйста, сделайте фото и отправьте его в этот чат.\n"
-            "Фото должно чётко показывать состояние техники.",
-            reply_markup=get_cancel_keyboard()
-        )
-        return
-    
-    await reply(message, "❌ Пожалуйста, отправьте фото или нажмите 'Сделать фото'")
-
-@dp.message(F.photo, UserStates.waiting_for_inspection_photo)
-async def handle_inspection_photo(message: types.Message, state: FSMContext):
-    """Обрабатывает отправленное фото"""
-    data = await state.get_data()
-    shift_id = data.get('shift_id')
-    
-    if not shift_id:
-        await reply(message, "❌ Ошибка: смена не найдена")
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    # Сохраняем file_id фото
-    photo_file_id = message.photo[-1].file_id
-    await db.update_shift_photo(shift_id, photo_file_id)
-    
-    # Отправляем подтверждение
-    await reply(
-        message,
-        "✅ <b>Фото осмотра принято!</b>\n\n"
-        "Фото отправлено начальнику парка для проверки.\n"
-        "Вы можете приступить к работе.\n\n"
-        "⚠️ <b>Важно:</b> Не забудьте провести ежедневные проверки техники."
-    )
-    
-    # Уведомляем начальника парка о новом фото
-    await notify_manager_about_new_photo(shift_id, message.from_user.id, photo_file_id)
-    
-    # Предлагаем пройти ежедневные проверки
-    await reply(
-        message,
-        "🔄 <b>Ежедневные проверки техники</b>\n\n"
-        "Рекомендуется проверить:\n"
-        "• Уровень масла в двигателе\n"
-        "• Уровень охлаждающей жидкости\n"
-        "• Давление в шинах\n"
-        "• Работу фар и стоп-сигналов\n"
-        "• Исправность тормозов\n\n"
-        "Хотите отметить выполненные проверки?",
-        reply_markup=get_yes_no_keyboard()
-    )
-    await state.set_state(UserStates.waiting_for_daily_checks)
-
-async def notify_manager_about_new_photo(shift_id, driver_id, photo_file_id):
-    """Уведомляет начальника парка о новом фото"""
-    try:
-        # Получаем информацию о смене
-        shift = await db.get_active_shift(driver_id)
-        if not shift:
-            return
-        
-        driver = await db.get_user(driver_id)
-        if not driver or not driver.get('organization_id'):
-            return
-        
-        # Получаем начальников парка
-        users = await db.get_users_by_organization(driver['organization_id'])
-        fleet_managers = [u for u in users if u['role'] == 'fleetmanager']
-        
-        for manager in fleet_managers:
-            try:
-                # Отправляем фото с подписью
-                await bot.send_photo(
-                    chat_id=manager['telegram_id'],
-                    photo=photo_file_id,
-                    caption=f"👷 <b>Новое фото осмотра</b>\n\n"
-                           f"🚛 <b>Водитель:</b> {driver['full_name']}\n"
-                           f"🚜 <b>Техника:</b> {shift.get('equipment_name', 'Неизвестно')}\n"
-                           f"🆔 <b>ID смены:</b> #{shift_id}\n\n"
-                           f"Для подтверждения осмотра используйте команду /check_inspections",
-                )
-            except:
-                continue
-                
-    except Exception as e:
-        logger.error(f"Ошибка при отправке уведомления о фото: {e}")
-
-@dp.message(UserStates.waiting_for_daily_checks)
-async def process_daily_checks_decision(message: types.Message, state: FSMContext):
-    """Обрабатывает решение о ежедневных проверках"""
-    if message.text == "❌ Отмена":
-        await cancel_shift(message, state)
-        return
-    
-    if message.text == "❌ Нет":
-        await reply(
-            message,
-            "ℹ️ <b>Ежедневные проверки пропущены</b>\n\n"
-            "Не забудьте проверить технику перед началом работы.\n"
-            "Вы можете завершить смену в любое время через меню."
-        )
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    if message.text == "✅ Да":
-        # Получаем список проверок
-        checks = await db.get_daily_checks()
-        if not checks:
-            await reply(message, "❌ Список проверок не найден")
-            await state.clear()
-            user = await db.get_user(message.from_user.id)
-            await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-            return
-        
-        # Сохраняем проверки в состоянии
-        await state.update_data(daily_checks=checks, current_check_index=0)
-        
-        # Начинаем первую проверку
-        await send_next_check(message, state)
-    else:
-        await reply(message, "❌ Пожалуйста, выберите 'Да' или 'Нет'")
-
-async def send_next_check(message: types.Message, state: FSMContext):
-    """Отправляет следующую проверку"""
-    data = await state.get_data()
-    checks = data.get('daily_checks', [])
-    current_index = data.get('current_check_index', 0)
-    
-    if current_index >= len(checks):
-        # Все проверки пройдены
-        await reply(
-            message,
-            "✅ <b>Все ежедневные проверки завершены!</b>\n\n"
-            "Техника готова к работе.\n"
-            "Не забудьте завершить смену после окончания работы.",
-            reply_markup=get_main_keyboard('driver', True)
-        )
-        await state.clear()
-        return
-    
-    current_check = checks[current_index]
-    
-    await reply(
-        message,
-        f"🔍 <b>Проверка {current_index + 1} из {len(checks)}</b>\n\n"
-        f"<b>Тип:</b> {current_check['type']}\n"
-        f"<b>Элемент:</b> {current_check['item']}\n"
-        f"<b>Что проверить:</b> {current_check['check']}\n\n"
-        f"<b>Статус элемента:</b>",
-        reply_markup=get_check_status_keyboard()
-    )
-
-@dp.message(UserStates.waiting_for_daily_checks)
-async def process_check_status(message: types.Message, state: FSMContext):
-    """Обрабатывает статус проверки"""
-    if message.text == "❌ Отмена":
-        await cancel_shift(message, state)
-        return
-    
-    if message.text == "⏭️ Пропустить":
-        # Пропускаем эту проверку
-        data = await state.get_data()
-        current_index = data.get('current_check_index', 0)
-        await state.update_data(current_check_index=current_index + 1)
-        await send_next_check(message, state)
-        return
-    
-    valid_statuses = ["✅ Исправно", "⚠️ Требует внимания", "❌ Неисправно"]
-    if message.text not in valid_statuses:
-        await reply(message, "❌ Пожалуйста, выберите статус из списка")
-        return
-    
-    data = await state.get_data()
-    shift_id = data.get('shift_id')
-    checks = data.get('daily_checks', [])
-    current_index = data.get('current_check_index', 0)
-    
-    if current_index < len(checks):
-        current_check = checks[current_index]
-        
-        # Сохраняем проверку в БД
-        await db.add_daily_check(
-            shift_id=shift_id,
-            check_type=current_check['type'],
-            item_name=current_check['item'],
-            status=message.text,
-            notes=None
-        )
-    
-    # Переходим к следующей проверке
-    await state.update_data(current_check_index=current_index + 1)
-    await send_next_check(message, state)
-
+ 
+# Обновите также функцию завершения смены для учета конечного одометра
 @dp.message(F.text == "✅ Закончить смену")
-async def end_shift_start(message: types.Message, state: FSMContext):
-    """Начинает процесс завершения смены"""
+async def end_shift_with_odometer(message: types.Message, state: FSMContext):
+    """Завершает смену с учетом одометра"""
     user = await db.get_user(message.from_user.id)
     
     if user['role'] != 'driver':
         await reply(message, "⛔ Только водители могут завершать смены!")
         return
     
-    # Проверяем активную смену
     active_shift = await db.get_active_shift(message.from_user.id)
     if not active_shift:
         await reply(message, "❌ У вас нет активной смены!")
@@ -2268,737 +1966,95 @@ async def end_shift_start(message: types.Message, state: FSMContext):
         message,
         f"🛑 <b>Завершение смены #{active_shift['id']}</b>\n\n"
         f"<b>Техника:</b> {active_shift.get('equipment_name', 'Неизвестно')}\n"
-        f"<b>Начало:</b> {active_shift['start_time'][:16]}\n\n"
-        f"Пожалуйста, добавьте заметки о работе за смену:\n"
-        f"(можно пропустить, отправив любое сообщение)",
-        reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="⏭️ Без заметок")], [types.KeyboardButton(text="❌ Отмена")]],
-            resize_keyboard=True
-        )
+        f"<b>Начало:</b> {active_shift['start_time'][:16]}\n"
+        f"<b>Начальный пробег:</b> {active_shift.get('start_odometer', 'Не указан')} км\n\n"
+        f"Введите конечные показания одометра (км):",
+        reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_shift_notes)
-
-@dp.message(UserStates.waiting_for_shift_notes)
-async def process_shift_notes(message: types.Message, state: FSMContext):
-    """Обрабатывает заметки о смене"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Завершение смены отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    data = await state.get_data()
-    shift_id = data.get('shift_id')
-    
-    notes = None
-    if message.text != "⏭️ Без заметок":
-        notes = message.text
-    
-    # Завершаем смену
-    success = await db.complete_shift(shift_id, notes)
-    
-    if success:
-        await reply(
-            message,
-            "✅ <b>Смена завершена успешно!</b>\n\n"
-            "Спасибо за работу!\n"
-            "Не забудьте сдать технику и заполнить документацию."
-        )
-        
-        # Уведомляем начальника парка
-        await notify_manager_about_shift_end(shift_id, message.from_user.id)
-    else:
-        await reply(message, "❌ Ошибка при завершении смены")
-    
-    await state.clear()
-    await cmd_start(message, state)
-
-async def notify_manager_about_shift_end(shift_id, driver_id):
-    """Уведомляет начальника парка о завершении смены"""
+ 
+# ========== СИСТЕМА НАПОМИНАНИЙ ==========
+ 
+async def check_and_send_notifications():
+    """Проверяет и отправляет напоминания"""
     try:
-        # Получаем информацию о смене
-        driver = await db.get_user(driver_id)
-        if not driver or not driver.get('organization_id'):
-            return
+        organizations = await db.get_all_organizations()
         
-        # Получаем начальников парка
-        users = await db.get_users_by_organization(driver['organization_id'])
-        fleet_managers = [u for u in users if u['role'] == 'fleetmanager']
-        
-        for manager in fleet_managers:
-            try:
-                await send_to_user(
-                    manager['telegram_id'],
-                    f"👷 <b>Смена завершена</b>\n\n"
-                    f"🚛 <b>Водитель:</b> {driver['full_name']}\n"
-                    f"🆔 <b>ID смены:</b> #{shift_id}\n"
-                    f"🕐 <b>Время:</b> {datetime.now().strftime('%H:%M %d.%m.%Y')}\n\n"
-                    f"Техника сдана, смена закрыта."
-                )
-            except:
-                continue
-                
-    except Exception as e:
-        logger.error(f"Ошибка при отправке уведомления о завершении смены: {e}")
-
-async def cancel_shift(message: types.Message, state: FSMContext):
-    """Отменяет начатую смену"""
-    data = await state.get_data()
-    shift_id = data.get('shift_id')
-    
-    if shift_id:
-        # Можно отметить смену как отменённую
-        await db.complete_shift(shift_id, "Отменена пользователем")
-    
-    await state.clear()
-    user = await db.get_user(message.from_user.id)
-    await reply(message, "❌ Смена отменена", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-
-@dp.message(F.text == "📋 Мои смены")
-async def my_shifts_history(message: types.Message):
-    """Показывает историю смен водителя"""
-    user = await db.get_user(message.from_user.id)
-    
-    if user['role'] != 'driver':
-        await reply(message, "⛔ Только водители могут просматривать свои смены!")
-        return
-    
-    shifts = await db.get_shifts_by_driver(message.from_user.id, limit=5)
-    
-    if not shifts:
-        await reply(
-            message,
-            "📋 <b>Мои смены</b>\n\n"
-            "У вас ещё не было смен.\n"
-            "Начните первую смену через меню '🚛 Начать смену'."
-        )
-        return
-    
-    text = f"📋 <b>Последние смены</b> ({len(shifts)})\n\n"
-    
-    for shift in shifts:
-        status_emoji = "🟢" if shift['status'] == 'active' else "✅" if shift['status'] == 'completed' else "❌"
-        text += f"{status_emoji} <b>Смена #{shift['id']}</b>\n"
-        text += f"🚜 {shift.get('equipment_name', 'Техника')}\n"
-        text += f"📅 {shift['start_time'][:16]}\n"
-        
-        if shift['end_time']:
-            text += f"🕐 До: {shift['end_time'][:16]}\n"
-        
-        text += f"📸 Осмотр: {'✅' if shift['inspection_approved'] else '⏳'}\n"
-        
-        if shift.get('notes'):
-            text += f"📝 {shift['notes'][:50]}...\n"
-        
-        text += "\n"
-    
-    text += "\n<code>Всего смен: ...</code>"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "🚜 Моя техника")
-async def my_equipment(message: types.Message):
-    """Показывает технику назначенную водителю"""
-    user = await db.get_user(message.from_user.id)
-    
-    if user['role'] != 'driver':
-        await reply(message, "⛔ Только водители могут просматривать свою технику!")
-        return
-    
-    org_id = user.get('organization_id')
-    if not org_id:
-        await reply(message, "❌ Вы не привязаны к организации! Обратитесь к начальнику парка.")
-        return
-    
-    # Получаем всю технику организации
-    equipment = await db.get_organization_equipment(org_id)
-    
-    if not equipment:
-        await reply(
-            message,
-            "🚜 <b>Моя техника</b>\n\n"
-            "В организации пока нет техники.\n"
-            "Обратитесь к начальнику парка."
-        )
-        return
-    
-    # Показываем всю технику (водитель может видеть что есть в организации)
-    text = f"🚜 <b>Техника организации</b> ({len(equipment)} ед.)\n\n"
-    
-    for eq in equipment[:10]:  # Показываем первые 10
-        text += f"<b>• {eq['name']}</b> ({eq['model']})\n"
-        text += f"  VIN: {eq['vin']}\n"
-        text += f"  Статус: {eq['status']}\n"
-        
-        # Показываем ближайшее ТО если есть
-        if eq.get('next_maintenance'):
-            next_date = datetime.strptime(eq['next_maintenance'], '%Y-%m-%d').date()
-            today = datetime.now().date()
-            days_left = (next_date - today).days
+        for org in organizations:
+            org_id = org['id']
             
-            if days_left <= 30:
-                if days_left < 0:
-                    text += f"  ⚠️ ТО просрочено на {abs(days_left)} дней\n"
-                elif days_left <= 7:
-                    text += f"  🔔 ТО через {days_left} дней\n"
-                else:
-                    text += f"  📅 ТО через {days_left} дней\n"
-        
-        text += "\n"
+            # Проверяем предстоящие ТО
+            upcoming_maintenance = await db.get_upcoming_maintenance(org_id, 7)  # На 7 дней вперед
+            
+            for maintenance in upcoming_maintenance:
+                equipment_name = maintenance.get('equipment_name', 'Неизвестная техника')
+                maintenance_type = maintenance.get('maintenance_type', 'ТО')
+                
+                # Получаем пользователей организации
+                users = await db.get_users_by_organization(org_id)
+                
+                # Отправляем уведомления директору и начальнику парка
+                for user in users:
+                    if user['role'] in ['director', 'fleetmanager']:
+                        try:
+                            await send_to_user(
+                                user['telegram_id'],
+                                f"🔔 <b>Напоминание о ТО</b>\n\n"
+                                f"🚜 <b>Техника:</b> {equipment_name}\n"
+                                f"🔧 <b>Тип ТО:</b> {maintenance_type}\n"
+                                f"📅 <b>Следующее ТО:</b> "
+                                f"{'через ' + str(maintenance.get('days_left', 0)) + ' дней' if maintenance.get('days_left') else 'скоро'}\n"
+                                f"📏 <b>Пробег:</b> {maintenance.get('odometer', 0)} км\n"
+                                f"🎯 <b>Цель:</b> {maintenance.get('next_due_km', 0)} км / {maintenance.get('next_due_date', 'не указано')}\n\n"
+                                f"⚠️ Запланируйте обслуживание заранее!"
+                            )
+                        except:
+                            continue
+            
+            # Проверяем низкий уровень топлива
+            low_fuel_equipment = await db.get_low_fuel_equipment(org_id, 15.0)
+            
+            for eq in low_fuel_equipment:
+                fuel_percentage = eq.get('fuel_percentage', 0)
+                
+                if fuel_percentage < 15:
+                    for user in users:
+                        if user['role'] in ['director', 'fleetmanager']:
+                            try:
+                                await send_to_user(
+                                    user['telegram_id'],
+                                    f"⚠️ <b>Низкий уровень топлива</b>\n\n"
+                                    f"🚜 <b>Техника:</b> {eq['name']} ({eq['model']})\n"
+                                    f"⛽ <b>Уровень:</b> {eq.get('current_fuel_level', 0)} л ({fuel_percentage}%)\n"
+                                    f"📏 <b>Одометр:</b> {eq.get('odometer', 0)} км\n\n"
+                                    f"🚨 Требуется заправка!"
+                                )
+                            except:
+                                continue
     
-    if len(equipment) > 10:
-        text += f"... и ещё {len(equipment) - 10} единиц техники\n"
-    
-    text += "\n<i>Для начала смены выберите технику из меню '🚛 Начать смену'</i>"
-    
-    await reply(message, text)
-
-@dp.message(F.text == "📊 Моя статистика")
-async def my_statistics(message: types.Message):
-    """Статистика для водителя"""
-    user = await db.get_user(message.from_user.id)
-    
-    if user['role'] != 'driver':
-        await reply(message, "⛔ Только водители могут просматривать свою статистику!")
-        return
-    
-    # Статистика за 30 дней
-    stats_30 = await db.get_driver_stats(message.from_user.id, 30)
-    # Статистика за 7 дней
-    stats_7 = await db.get_driver_stats(message.from_user.id, 7)
-    
-    text = f"📊 <b>Ваша статистика</b>\n\n"
-    
-    text += "<b>📅 За последние 7 дней:</b>\n"
-    text += f"• Смен: {stats_7.get('shifts_count', 0)}\n"
-    text += f"• Средняя продолжительность: {stats_7.get('avg_shift_hours', 0)}ч\n"
-    text += f"• Разной техники: {stats_7.get('equipment_used', 0)} ед.\n\n"
-    
-    text += "<b>📅 За последние 30 дней:</b>\n"
-    text += f"• Смен: {stats_30.get('shifts_count', 0)}\n"
-    text += f"• Средняя продолжительность: {stats_30.get('avg_shift_hours', 0)}ч\n"
-    text += f"• Разной техники: {stats_30.get('equipment_used', 0)} ед.\n\n"
-    
-    # Получаем последние смены
-    shifts = await db.get_shifts_by_driver(message.from_user.id, 3)
-    if shifts:
-        text += "<b>📋 Последние смены:</b>\n"
-        for shift in shifts:
-            date = datetime.strptime(shift['start_time'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m")
-            status = "🟢" if shift['status'] == 'active' else "✅"
-            text += f"{status} {date}: {shift.get('equipment_name', 'Техника')}"
-            if shift.get('end_time'):
-                end = datetime.strptime(shift['end_time'], "%Y-%m-%d %H:%M:%S")
-                start = datetime.strptime(shift['start_time'], "%Y-%m-%d %H:%M:%S")
-                hours = round((end - start).total_seconds() / 3600, 1)
-                text += f" ({hours}ч)"
-            text += "\n"
-    
-    await reply(message, text)
-
-# ========== ДОБАВЛЕНИЕ ТЕХНИКИ ==========
-
-@dp.message(UserStates.waiting_for_equipment_name)
-async def process_equipment_name(message: types.Message, state: FSMContext):
-    """Обрабатывает название техники"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    await state.update_data(name=message.text)
-    await reply(
-        message,
-        "✅ Название принято!\n\nТеперь введите модель техники:",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(UserStates.waiting_for_equipment_model)
-
-@dp.message(UserStates.waiting_for_equipment_model)
-async def process_equipment_model(message: types.Message, state: FSMContext):
-    """Обрабатывает модель техники"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    await state.update_data(model=message.text)
-    await reply(
-        message,
-        "✅ Модель принята!\n\nТеперь введите VIN (уникальный номер):",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(UserStates.waiting_for_equipment_vin)
-
-@dp.message(UserStates.waiting_for_equipment_vin)
-async def process_equipment_vin(message: types.Message, state: FSMContext):
-    """Обрабатывает VIN техники"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    data = await state.get_data()
-    org_id = data['org_id']
-    name = data['name']
-    model = data['model']
-    vin = message.text
-    
-    try:
-        eq_id = await db.add_equipment(name, model, vin, org_id)
-        
-        await reply(
-            message,
-            f"✅ <b>Техника добавлена!</b>\n\n"
-            f"<b>Название:</b> {name}\n"
-            f"<b>Модель:</b> {model}\n"
-            f"<b>VIN:</b> {vin}\n"
-            f"<b>ID техники:</b> {eq_id}\n\n"
-            f"Техника доступна в автопарке организации."
-        )
     except Exception as e:
-        logger.error(f"Ошибка при добавлении техники: {e}")
-        await reply(
-            message,
-            f"❌ <b>Ошибка добавления техники!</b>\n\n"
-            f"Возможно, техника с таким VIN уже существует."
-        )
+        logger.error(f"Ошибка в системе напоминаний: {e}")
+ 
+# ========== ПЛАНИРОВЩИК ==========
+ 
+async def scheduler():
+    """Планировщик задач"""
+    # Проверяем напоминания каждый час
+    aioschedule.every().hour.do(check_and_send_notifications)
     
-    await state.clear()
-    user = await db.get_user(message.from_user.id)
-    await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-
-# ========== НАЗНАЧЕНИЕ РОЛИ ==========
-
-@dp.message(F.text == "➕ Назначить роль")
-async def assign_role_start(message: types.Message, state: FSMContext):
-    """Начинает назначение роли"""
-    user = await db.get_user(message.from_user.id)
-    
-    # Проверяем права
-    if user['role'] == 'driver':
-        await reply(message, "⛔ У водителей нет прав назначать роли!")
-        return
-    
-    await reply(
-        message,
-        "👤 <b>Назначение роли</b>\n\n"
-        "Введите Telegram ID или @username пользователя:\n\n"
-        "<b>Примеры:</b>\n"
-        "• 123456789 (ID)\n"
-        "• @username\n"
-        "• username (без @)",
-        reply_markup=get_cancel_keyboard()
-    )
-    await state.set_state(UserStates.waiting_for_username_or_id)
-
-@dp.message(UserStates.waiting_for_username_or_id)
-async def process_username_or_id(message: types.Message, state: FSMContext):
-    """Обрабатывает ввод username или ID"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    identifier = message.text.strip()
-    
-    # Сохраняем в состоянии
-    await state.update_data(identifier=identifier)
-    
-    # Определяем доступные роли для назначения
-    user = await db.get_user(message.from_user.id)
-    user_role = user['role']
-    
-    if user_role == 'botadmin':
-        roles = ["👑 Администратор", "👨‍💼 Директор", "👷 Начальник парка", "🚛 Водитель"]
-    elif user_role == 'director':
-        roles = ["👷 Начальник парка", "🚛 Водитель"]
-    elif user_role == 'fleetmanager':
-        roles = ["🚛 Водитель"]
-    else:
-        roles = []
-    
-    if not roles:
-        await reply(message, "❌ У вас нет прав для назначения ролей!")
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "Возврат в главное меню", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    keyboard = []
-    for role in roles:
-        keyboard.append([types.KeyboardButton(text=role)])
-    keyboard.append([types.KeyboardButton(text="❌ Отмена")])
-    
-    await reply(
-        message,
-        f"✅ Получено: {identifier}\n\n"
-        f"Выберите роль для назначения:",
-        reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-    )
-    await state.set_state(UserStates.waiting_for_role)
-
-@dp.message(UserStates.waiting_for_role)
-async def process_role_selection(message: types.Message, state: FSMContext):
-    """Обрабатывает выбор роли"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Отменено", reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    role_map = {
-        "👑 Администратор": "botadmin",
-        "👨‍💼 Директор": "director",
-        "👷 Начальник парка": "fleetmanager",
-        "🚛 Водитель": "driver"
-    }
-    
-    selected_role = role_map.get(message.text)
-    if not selected_role:
-        await reply(message, "❌ Неверная роль! Выберите из списка.")
-        return
-    
-    data = await state.get_data()
-    identifier = data['identifier']
-    
-    # Определяем ID пользователя
-    user_id = None
-    
-    # Если identifier - число (ID)
-    if identifier.isdigit():
-        user_id = int(identifier)
-    else:
-        # Если это username (с @ или без)
-        username = identifier.replace('@', '')
-        
-        # Ищем пользователя в базе по username
-        all_users = await db.get_all_users()
-        for user in all_users:
-            if user.get('username') == username:
-                user_id = user['telegram_id']
-                break
-    
-    if not user_id:
-        await reply(
-            message,
-            f"❌ Пользователь '{identifier}' не найден!\n\n"
-            f"Попросите пользователя написать боту /start, "
-            f"чтобы он зарегистрировался в системе."
-        )
-        await state.clear()
-        return
-    
-    # Получаем организацию назначающего (если нужно)
-    assigner = await db.get_user(message.from_user.id)
-    assigner_role = assigner['role']
-    org_id = assigner.get('organization_id')
-    
-    # Проверяем права на назначение этой роли
-    can_assign = {
-        'botadmin': ['botadmin', 'director', 'fleetmanager', 'driver'],
-        'director': ['fleetmanager', 'driver'],
-        'fleetmanager': ['driver']
-    }
-    
-    if selected_role not in can_assign.get(assigner_role, []):
-        await reply(
-            message,
-            f"⛔ У вас нет прав назначать роль '{selected_role}'!\n"
-            f"Ваша роль: {assigner_role}"
-        )
-        await state.clear()
-        return
-    
-    # Назначаем роль
-    success = await db.update_user_role(user_id, selected_role, org_id)
-    
-    if success:
-        role_names = {
-            'botadmin': '👑 Администратора',
-            'director': '👨‍💼 Директора',
-            'fleetmanager': '👷 Начальника парка',
-            'driver': '🚛 Водителя'
-        }
-        
-        await reply(
-            message,
-            f"✅ <b>Роль назначена успешно!</b>\n\n"
-            f"<b>Пользователь:</b> {identifier}\n"
-            f"<b>ID:</b> {user_id}\n"
-            f"<b>Роль:</b> {role_names.get(selected_role, selected_role)}\n"
-            f"{f'<b>Организация:</b> {org_id}' if org_id else ''}"
-        )
-        
-        # Уведомляем пользователя
-        try:
-            await bot.send_message(
-                user_id,
-                f"🎉 <b>Вам назначена новая роль!</b>\n\n"
-                f"<b>Роль:</b> {role_names.get(selected_role, selected_role)}\n"
-                f"<b>Назначил:</b> {message.from_user.full_name}\n\n"
-                f"Напишите /start для обновления меню."
-            )
-        except:
-            pass
-    else:
-        await reply(message, "❌ Ошибка при назначении роли!")
-    
-    await state.clear()
-    await cmd_start(message, state)
-
-# ========== КОМАНДЫ ==========
-
-@dp.message(Command("myrole"))
-async def myrole_cmd(message: types.Message):
-    """Показывает роль пользователя"""
-    user = await db.get_user(message.from_user.id)
-    
-    if not user:
-        await reply(message, "❌ Вы не зарегистрированы!")
-        return
-    
-    role_names = {
-        'botadmin': '👑 Администратор бота',
-        'director': '👨‍💼 Директор компании',
-        'fleetmanager': '👷 Начальник парка',
-        'driver': '🚛 Водитель'
-    }
-    
-    org_info = ""
-    if user.get('organization_id'):
-        org = await db.get_organization(user['organization_id'])
-        if org:
-            org_info = f"<b>Организация:</b> {org['name']} (ID: {org['id']})\n"
-    
-    await reply(
-        message,
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"<b>ID:</b> {user['telegram_id']}\n"
-        f"<b>Имя:</b> {user['full_name']}\n"
-        f"<b>Роль:</b> {role_names.get(user['role'], user['role'])}\n"
-        f"{org_info}"
-        f"<b>Зарегистрирован:</b> {user['created_at'][:10]}"
-    )
-
-@dp.message(Command("setrole"))
-async def setrole_cmd(message: types.Message):
-    """Команда для назначения роли (поддержка ID и username)"""
-    parts = message.text.split()
-    
-    if len(parts) < 3:
-        await reply(
-            message,
-            "❌ <b>Неверный формат!</b>\n\n"
-            "<b>Использование:</b>\n"
-            "<code>/setrole ID_ИЛИ_USERNAME РОЛЬ</code>\n\n"
-            "<b>Примеры:</b>\n"
-            "<code>/setrole 123456789 director</code>\n"
-            "<code>/setrole @username fleetmanager</code>\n"
-            "<code>/setrole username driver</code>\n\n"
-            "<b>Доступные роли:</b>\n"
-            "• botadmin\n"
-            "• director\n"
-            "• fleetmanager\n"
-            "• driver"
-        )
-        return
-    
-    identifier = parts[1]
-    new_role = parts[2].lower()
-    
-    # Проверяем существование роли
-    valid_roles = ['botadmin', 'director', 'fleetmanager', 'driver']
-    if new_role not in valid_roles:
-        await reply(
-            message,
-            f"❌ <b>Неверная роль!</b>\n\n"
-            f"Доступные роли: {', '.join(valid_roles)}"
-        )
-        return
-    
-    # Ищем пользователя
-    user_id = None
-    
-    # Если identifier - число
-    if identifier.isdigit():
-        user_id = int(identifier)
-    else:
-        # Если это username
-        username = identifier.replace('@', '')
-        
-        # Ищем в базе
-        all_users = await db.get_all_users()
-        for user in all_users:
-            if user.get('username') == username:
-                user_id = user['telegram_id']
-                break
-    
-    if not user_id:
-        await reply(
-            message,
-            f"❌ <b>Пользователь не найден!</b>\n\n"
-            f"Попросите пользователя {identifier} написать боту /start."
-        )
-        return
-    
-    # Проверяем права назначающего
-    assigner = await db.get_user(message.from_user.id)
-    assigner_role = assigner['role']
-    
-    # Иерархия прав
-    can_assign = {
-        'botadmin': ['botadmin', 'director', 'fleetmanager', 'driver'],
-        'director': ['fleetmanager', 'driver'],
-        'fleetmanager': ['driver'],
-        'driver': []
-    }
-    
-    if new_role not in can_assign.get(assigner_role, []):
-        await reply(
-            message,
-            f"⛔ <b>У вас нет прав назначать роль '{new_role}'!</b>\n\n"
-            f"Ваша роль: {assigner_role}\n"
-            f"Вы можете назначать только: {', '.join(can_assign.get(assigner_role, []))}"
-        )
-        return
-    
-    # Назначаем организацию если нужно
-    org_id = assigner.get('organization_id') if assigner_role in ['director', 'fleetmanager'] else None
-    
-    # Назначаем роль
-    success = await db.update_user_role(user_id, new_role, org_id)
-    
-    if success:
-        role_names = {
-            'botadmin': '👑 Администратор бота',
-            'director': '👨‍💼 Директор компании',
-            'fleetmanager': '👷 Начальник парка',
-            'driver': '🚛 Водитель'
-        }
-        
-        await reply(
-            message,
-            f"✅ <b>Роль назначена!</b>\n\n"
-            f"<b>Пользователь:</b> {identifier}\n"
-            f"<b>ID:</b> {user_id}\n"
-            f"<b>Роль:</b> {role_names.get(new_role, new_role)}\n"
-            f"{f'<b>Организация:</b> {org_id}' if org_id else ''}"
-        )
-        
-        # Уведомляем пользователя
-        try:
-            await bot.send_message(
-                user_id,
-                f"🎉 <b>Вам назначена новая роль!</b>\n\n"
-                f"<b>Роль:</b> {role_names.get(new_role, new_role)}\n"
-                f"<b>Назначил:</b> {message.from_user.full_name}\n\n"
-                f"Напишите /start для обновления меню."
-            )
-        except:
-            pass
-    else:
-        await reply(message, "❌ Ошибка при назначении роли!")
-
-# ========== CALLBACK ОБРАБОТЧИКИ ==========
-
-@dp.callback_query(F.data.startswith("approve_inspection:"))
-async def approve_inspection_callback(callback: types.CallbackQuery):
-    """Подтверждает осмотр"""
-    shift_id = int(callback.data.split(":")[1])
-    
-    success = await db.approve_inspection(shift_id, callback.from_user.id)
-    
-    if success:
-        await callback.message.edit_text(
-            f"✅ <b>Осмотр подтверждён!</b>\n\n"
-            f"Смена #{shift_id}\n"
-            f"Подтвердил: {callback.from_user.full_name}"
-        )
-        await callback.answer("Осмотр подтверждён!")
-    else:
-        await callback.answer("❌ Ошибка при подтверждении осмотра", show_alert=True)
-
-@dp.callback_query(F.data.startswith("reject_inspection:"))
-async def reject_inspection_callback(callback: types.CallbackQuery):
-    """Отклоняет осмотр"""
-    shift_id = int(callback.data.split(":")[1])
-    
-    await callback.message.edit_text(
-        f"❌ <b>Осмотр отклонён</b>\n\n"
-        f"Смена #{shift_id}\n"
-        f"Отклонил: {callback.from_user.full_name}\n\n"
-        f"Водитель будет уведомлён о необходимости нового осмотра."
-    )
-    await callback.answer("Осмотр отклонён")
-
-# ========== ИНФОРМАЦИЯ ==========
-
-@dp.message(F.text == "ℹ️ Информация")
-async def info(message: types.Message):
-    """Показывает информацию"""
-    user = await db.get_user(message.from_user.id)
-    role_names = {
-        'botadmin': '👑 Администратор бота',
-        'director': '👨‍💼 Директор компании',
-        'fleetmanager': '👷 Начальник парка',
-        'driver': '🚛 Водитель'
-    }
-    
-    org_info = ""
-    if user.get('organization_id'):
-        org = await db.get_organization(user['organization_id'])
-        if org:
-            org_info = f"<b>Организация:</b> {org['name']}\n"
-    
-    await reply(
-        message,
-        f"🤖 <b>ТехКонтроль v2.0</b>\n\n"
-        f"<b>Ваша роль:</b> {role_names.get(user['role'], '👤 Пользователь')}\n"
-        f"{org_info}"
-        f"<b>ID:</b> {message.from_user.id}\n\n"
-        "<b>Назначение бота:</b>\n"
-        "• Учет и контроль спецтехники\n"
-        "• Управление водителями\n"
-        "• Отслеживание ТО и ремонтов\n"
-        "• Ежедневное обслуживание\n\n"
-        "<b>Основные функции:</b>\n"
-        "• Создание и управление организациями\n"
-        "• Учет техники\n"
-        "• Система смен водителей\n"
-        "• Техническое обслуживание\n"
-        "• Статистика и отчеты\n\n"
-        "<b>По вопросам:</b>\n"
-        "Обращайтесь к администратору вашей организации."
-    )
-
-# ========== ОБРАБОТКА НЕИЗВЕСТНЫХ КОМАНД ==========
-
-@dp.message()
-async def handle_unknown(message: types.Message):
-    """Обрабатывает неизвестные команды"""
-    await reply(
-        message,
-        "🤔 <b>Неизвестная команда</b>\n\n"
-        "Используйте меню или команды:\n"
-        "/start - главное меню\n"
-        "/myrole - моя роль\n"
-        "/help - справка"
-    )
-
+    while True:
+        await aioschedule.run_pending()
+        await asyncio.sleep(60)  # Проверяем каждую минуту
+ 
 # ========== ЗАПУСК БОТА ==========
-
+ 
 async def on_startup():
     """Инициализация при запуске"""
     try:
         await db.connect()
         
-        # Создаем администратора (замени на свой ID)
-        ADMIN_ID = 1079922982  # ВАШ TELEGRAM ID
+        # Создаем администратора
+        ADMIN_ID = 1079922982  # Ваш Telegram ID
         await db.register_user(
             telegram_id=ADMIN_ID,
             full_name="Администратор Системы",
@@ -3006,12 +2062,16 @@ async def on_startup():
             role='botadmin'
         )
         
+        # Запускаем планировщик в фоне
+        asyncio.create_task(scheduler())
+        
         logger.info("✅ Бот запущен!")
         logger.info(f"👑 Администратор: ID {ADMIN_ID}")
+        logger.info(f"🤖 ИИ помощник: {'ВКЛ' if AI_ENABLED else 'ВЫКЛ'}")
         
     except Exception as e:
         logger.error(f"❌ Ошибка запуска: {e}")
-
+ 
 async def main():
     """Основная функция"""
     await on_startup()
@@ -3023,6 +2083,6 @@ async def main():
         logger.error(f"❌ Критическая ошибка: {e}")
     finally:
         await db.close()
-
+ 
 if __name__ == "__main__":
     asyncio.run(main())
