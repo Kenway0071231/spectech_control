@@ -2,8 +2,9 @@ import sqlite3
 import aiosqlite
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import json
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class Database:
         """Устанавливает соединение с базой данных"""
         try:
             self.conn = await aiosqlite.connect(self.db_path)
-            self.conn.row_factory = aiosqlite.Row  # Для доступа по имени столбца
+            self.conn.row_factory = aiosqlite.Row
             await self.create_tables()
             logger.info("✅ База данных подключена")
             return True
@@ -33,7 +34,7 @@ class Database:
     async def create_tables(self):
         """Создает все необходимые таблицы"""
         try:
-            # Таблица пользователей
+            # Существующие таблицы...
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id INTEGER PRIMARY KEY,
@@ -41,39 +42,145 @@ class Database:
                     username TEXT,
                     role TEXT NOT NULL DEFAULT 'unassigned',
                     organization_id INTEGER,
+                    phone_number TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (organization_id) REFERENCES organizations(id)
                 )
             ''')
             
-            # Таблица организаций
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS organizations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
                     director_id INTEGER UNIQUE,
+                    address TEXT,
+                    contact_phone TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (director_id) REFERENCES users(telegram_id)
                 )
             ''')
             
-            # Таблица техники
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS equipment (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     model TEXT NOT NULL,
                     vin TEXT NOT NULL UNIQUE,
+                    registration_number TEXT,
                     organization_id INTEGER NOT NULL,
                     status TEXT DEFAULT 'active',
                     next_maintenance DATE,
+                    last_maintenance DATE,
+                    fuel_type TEXT DEFAULT 'diesel',
+                    fuel_capacity REAL,
+                    current_fuel_level REAL DEFAULT 0,
+                    odometer INTEGER DEFAULT 0,
                     notes TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (organization_id) REFERENCES organizations(id)
                 )
             ''')
             
-            # Таблица назначения техники водителям
+            # НОВАЯ: Таблица для детальной информации о ТО
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS maintenance_schedule (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    equipment_id INTEGER NOT NULL,
+                    maintenance_type TEXT NOT NULL,
+                    interval_km INTEGER,
+                    interval_days INTEGER,
+                    last_done_km INTEGER DEFAULT 0,
+                    last_done_date DATE,
+                    next_due_km INTEGER,
+                    next_due_date DATE,
+                    description TEXT,
+                    parts_needed TEXT,
+                    estimated_hours REAL,
+                    FOREIGN KEY (equipment_id) REFERENCES equipment(id)
+                )
+            ''')
+            
+            # НОВАЯ: Таблица учета топлива
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS fuel_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    equipment_id INTEGER NOT NULL,
+                    driver_id INTEGER,
+                    fuel_amount REAL NOT NULL,
+                    fuel_type TEXT DEFAULT 'diesel',
+                    cost_per_liter REAL,
+                    total_cost REAL,
+                    odometer_reading INTEGER,
+                    fueling_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    fueling_station TEXT,
+                    receipt_photo TEXT,
+                    notes TEXT,
+                    FOREIGN KEY (equipment_id) REFERENCES equipment(id),
+                    FOREIGN KEY (driver_id) REFERENCES users(telegram_id)
+                )
+            ''')
+            
+            # НОВАЯ: Таблица запчастей
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS spare_parts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id INTEGER NOT NULL,
+                    part_name TEXT NOT NULL,
+                    part_number TEXT,
+                    description TEXT,
+                    category TEXT,
+                    quantity INTEGER DEFAULT 0,
+                    min_quantity INTEGER DEFAULT 1,
+                    supplier TEXT,
+                    supplier_contact TEXT,
+                    last_ordered DATE,
+                    unit_price REAL,
+                    location TEXT,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id)
+                )
+            ''')
+            
+            # НОВАЯ: Таблица заказов
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id INTEGER NOT NULL,
+                    order_type TEXT NOT NULL, -- 'fuel', 'parts', 'service'
+                    equipment_id INTEGER,
+                    part_id INTEGER,
+                    quantity INTEGER,
+                    urgent BOOLEAN DEFAULT FALSE,
+                    status TEXT DEFAULT 'pending', -- pending, approved, ordered, delivered, cancelled
+                    requested_by INTEGER,
+                    approved_by INTEGER,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id),
+                    FOREIGN KEY (equipment_id) REFERENCES equipment(id),
+                    FOREIGN KEY (part_id) REFERENCES spare_parts(id),
+                    FOREIGN KEY (requested_by) REFERENCES users(telegram_id),
+                    FOREIGN KEY (approved_by) REFERENCES users(telegram_id)
+                )
+            ''')
+            
+            # НОВАЯ: Таблица для хранения инструкций и схем
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS instructions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    equipment_model TEXT NOT NULL,
+                    instruction_type TEXT NOT NULL, -- 'greasing', 'maintenance', 'operation'
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    steps TEXT, -- JSON список шагов
+                    diagram_photo TEXT,
+                    video_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Существующие таблицы...
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS driver_equipment (
                     driver_id INTEGER NOT NULL,
@@ -85,7 +192,6 @@ class Database:
                 )
             ''')
             
-            # Таблица смен
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS shifts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +199,8 @@ class Database:
                     equipment_id INTEGER NOT NULL,
                     start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     end_time TIMESTAMP,
+                    start_odometer INTEGER,
+                    end_odometer INTEGER,
                     briefing_confirmed BOOLEAN DEFAULT FALSE,
                     inspection_photo TEXT,
                     inspection_approved BOOLEAN DEFAULT FALSE,
@@ -105,7 +213,6 @@ class Database:
                 )
             ''')
             
-            # Таблица ежедневных проверок
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS daily_checks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +226,6 @@ class Database:
                 )
             ''')
             
-            # Таблица технического обслуживания (ТО)
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS maintenance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,12 +235,16 @@ class Database:
                     completed_date DATE,
                     description TEXT,
                     status TEXT DEFAULT 'scheduled',
+                    cost REAL,
+                    performed_by TEXT,
+                    parts_used TEXT,
+                    odometer_at_service INTEGER,
+                    next_service_km INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (equipment_id) REFERENCES equipment(id)
                 )
             ''')
             
-            # Таблица журнала действий
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS action_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +256,6 @@ class Database:
                 )
             ''')
             
-            # Таблица ежедневных проверок (шаблоны)
             await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS daily_check_templates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,11 +266,48 @@ class Database:
                 )
             ''')
             
-            await self.conn.commit()
-            logger.info("✅ Таблицы созданы/проверены")
+            # НОВАЯ: Таблица для AI контекста и обучения
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS ai_context (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id INTEGER,
+                    context_type TEXT NOT NULL, -- 'greasing', 'maintenance', 'troubleshooting'
+                    equipment_model TEXT,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source TEXT, -- 'ai', 'manual', 'instruction'
+                    verified BOOLEAN DEFAULT FALSE,
+                    verified_by INTEGER,
+                    usage_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id),
+                    FOREIGN KEY (verified_by) REFERENCES users(telegram_id)
+                )
+            ''')
             
-            # Добавляем шаблоны проверок, если их нет
+            # НОВАЯ: Таблица для настроек уведомлений
+            await self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS notification_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    organization_id INTEGER NOT NULL,
+                    notification_type TEXT NOT NULL,
+                    days_before INTEGER DEFAULT 7,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    notify_director BOOLEAN DEFAULT TRUE,
+                    notify_fleetmanager BOOLEAN DEFAULT TRUE,
+                    notify_driver BOOLEAN DEFAULT FALSE,
+                    FOREIGN KEY (organization_id) REFERENCES organizations(id)
+                )
+            ''')
+            
+            await self.conn.commit()
+            
+            # Добавляем шаблоны проверок
             await self.init_daily_checks()
+            # Добавляем стандартные настройки уведомлений
+            await self.init_notification_settings()
+            
+            logger.info("✅ Все таблицы созданы/проверены")
             
         except Exception as e:
             logger.error(f"❌ Ошибка создания таблиц: {e}")
@@ -173,18 +319,31 @@ class Database:
             ("engine", "Масло двигателя", "Проверить уровень и состояние"),
             ("engine", "Охлаждающая жидкость", "Проверить уровень"),
             ("engine", "Тормозная жидкость", "Проверить уровень"),
+            ("engine", "Жидкость ГУР", "Проверить уровень"),
             ("tires", "Давление в шинах", "Проверить давление (передние/задние)"),
             ("tires", "Протектор шин", "Проверить износ"),
+            ("tires", "Внешний вид шин", "Проверить на порезы, гвозди"),
             ("lights", "Фары ближнего света", "Проверить работу"),
             ("lights", "Фары дальнего света", "Проверить работу"),
             ("lights", "Стоп-сигналы", "Проверить работу"),
             ("lights", "Поворотники", "Проверить работу"),
+            ("lights", "Габаритные огни", "Проверить работу"),
             ("safety", "Зеркала", "Проверить чистоту и регулировку"),
             ("safety", "Ремни безопасности", "Проверить исправность"),
             ("safety", "Огнетушитель", "Наличие и срок годности"),
+            ("safety", "Аптечка", "Наличие и срок годности"),
+            ("safety", "Знак аварийной остановки", "Наличие"),
+            ("fluids", "Топливный фильтр", "Проверить на подтеки"),
+            ("fluids", "Масляный фильтр", "Проверить на подтеки"),
+            ("brakes", "Тормозные колодки", "Проверить износ"),
+            ("brakes", "Тормозные диски", "Проверить состояние"),
             ("interior", "Приборная панель", "Проверить показания"),
             ("interior", "Звуковой сигнал", "Проверить работу"),
-            ("interior", "Стеклоочистители", "Проверить работу и состояние щеток")
+            ("interior", "Стеклоочистители", "Проверить работу и состояние щеток"),
+            ("interior", "Омыватель стекла", "Проверить уровень жидкости"),
+            ("exterior", "Кузов", "Проверить на повреждения"),
+            ("exterior", "Зеркала заднего вида", "Проверить целостность"),
+            ("exterior", "Стекла", "Проверить на трещины"),
         ]
         
         for check_type, item, description in checks:
@@ -198,7 +357,584 @@ class Database:
         
         await self.conn.commit()
     
-    # ========== ПОЛЬЗОВАТЕЛИ ==========
+    async def init_notification_settings(self):
+        """Инициализирует настройки уведомлений"""
+        settings = [
+            ("maintenance", 7, True, True, True, False),
+            ("maintenance", 1, True, True, True, True),
+            ("fuel_low", 0, True, False, True, True),
+            ("inspection_due", 0, True, True, True, False),
+            ("order_approved", 0, True, True, True, False),
+        ]
+        
+        for setting in settings:
+            try:
+                await self.conn.execute('''
+                    INSERT OR IGNORE INTO notification_settings 
+                    (notification_type, days_before, enabled, notify_director, notify_fleetmanager, notify_driver)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', setting)
+            except:
+                pass
+        
+        await self.conn.commit()
+    
+    # ========== НОВЫЕ МЕТОДЫ ДЛЯ ИИ ==========
+    
+    async def add_ai_context(self, organization_id: int, context_type: str, equipment_model: str, 
+                           question: str, answer: str, source: str = 'ai') -> Optional[int]:
+        """Добавляет контекст для ИИ"""
+        try:
+            cursor = await self.conn.execute(
+                """INSERT INTO ai_context 
+                (organization_id, context_type, equipment_model, question, answer, source) 
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (organization_id, context_type, equipment_model, question, answer, source)
+            )
+            await self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка добавления AI контекста: {e}")
+            return None
+    
+    async def get_ai_context(self, organization_id: int = None, context_type: str = None, 
+                           equipment_model: str = None, limit: int = 5) -> List[Dict]:
+        """Получает контекст для ИИ"""
+        try:
+            query = "SELECT * FROM ai_context WHERE 1=1"
+            params = []
+            
+            if organization_id:
+                query += " AND organization_id = ?"
+                params.append(organization_id)
+            
+            if context_type:
+                query += " AND context_type = ?"
+                params.append(context_type)
+            
+            if equipment_model:
+                query += " AND equipment_model LIKE ?"
+                params.append(f"%{equipment_model}%")
+            
+            query += " ORDER BY usage_count DESC, created_at DESC LIMIT ?"
+            params.append(limit)
+            
+            cursor = await self.conn.execute(query, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения AI контекста: {e}")
+            return []
+    
+    async def increment_ai_usage(self, context_id: int) -> bool:
+        """Увеличивает счетчик использования AI контекста"""
+        try:
+            await self.conn.execute(
+                "UPDATE ai_context SET usage_count = usage_count + 1 WHERE id = ?",
+                (context_id,)
+            )
+            await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления AI использования: {e}")
+            return False
+    
+    # ========== НОВЫЕ МЕТОДЫ ДЛЯ ТОПЛИВА ==========
+    
+    async def add_fuel_log(self, equipment_id: int, driver_id: int, fuel_amount: float, 
+                         fuel_type: str = 'diesel', cost_per_liter: float = None,
+                         total_cost: float = None, odometer_reading: int = None,
+                         fueling_station: str = None, receipt_photo: str = None, 
+                         notes: str = None) -> Optional[int]:
+        """Добавляет запись о заправке"""
+        try:
+            cursor = await self.conn.execute(
+                """INSERT INTO fuel_logs 
+                (equipment_id, driver_id, fuel_amount, fuel_type, cost_per_liter, 
+                 total_cost, odometer_reading, fueling_station, receipt_photo, notes) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (equipment_id, driver_id, fuel_amount, fuel_type, cost_per_liter,
+                 total_cost, odometer_reading, fueling_station, receipt_photo, notes)
+            )
+            
+            # Обновляем текущий уровень топлива в технике
+            await self.conn.execute(
+                "UPDATE equipment SET current_fuel_level = current_fuel_level + ? WHERE id = ?",
+                (fuel_amount, equipment_id)
+            )
+            
+            # Обновляем одометр если указан
+            if odometer_reading:
+                await self.conn.execute(
+                    "UPDATE equipment SET odometer = ? WHERE id = ?",
+                    (odometer_reading, equipment_id)
+                )
+            
+            await self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка добавления записи о топливе: {e}")
+            return None
+    
+    async def get_fuel_logs(self, equipment_id: int = None, driver_id: int = None, 
+                          days: int = 30) -> List[Dict]:
+        """Получает записи о заправках"""
+        try:
+            query = """
+                SELECT fl.*, e.name as equipment_name, u.full_name as driver_name 
+                FROM fuel_logs fl
+                LEFT JOIN equipment e ON fl.equipment_id = e.id
+                LEFT JOIN users u ON fl.driver_id = u.telegram_id
+                WHERE 1=1
+            """
+            params = []
+            
+            if equipment_id:
+                query += " AND fl.equipment_id = ?"
+                params.append(equipment_id)
+            
+            if driver_id:
+                query += " AND fl.driver_id = ?"
+                params.append(driver_id)
+            
+            if days:
+                query += " AND DATE(fl.fueling_date) >= DATE('now', ?)"
+                params.append(f'-{days} days')
+            
+            query += " ORDER BY fl.fueling_date DESC"
+            
+            cursor = await self.conn.execute(query, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения записей о топливе: {e}")
+            return []
+    
+    async def get_fuel_statistics(self, equipment_id: int, days: int = 30) -> Dict:
+        """Получает статистику по топливу"""
+        stats = {}
+        try:
+            # Общее количество топлива
+            cursor = await self.conn.execute('''
+                SELECT SUM(fuel_amount) as total_fuel, SUM(total_cost) as total_cost,
+                       AVG(cost_per_liter) as avg_price
+                FROM fuel_logs 
+                WHERE equipment_id = ? AND DATE(fueling_date) >= DATE('now', ?)
+            ''', (equipment_id, f'-{days} days'))
+            result = await cursor.fetchone()
+            stats.update(dict(result) if result else {})
+            await cursor.close()
+            
+            # Средний расход (если есть данные об одометре)
+            cursor = await self.conn.execute('''
+                SELECT fl1.odometer_reading as start_odo, fl2.odometer_reading as end_odo,
+                       SUM(fl2.fuel_amount) as fuel_used
+                FROM fuel_logs fl1
+                JOIN fuel_logs fl2 ON fl1.equipment_id = fl2.equipment_id 
+                    AND fl2.fueling_date > fl1.fueling_date
+                WHERE fl1.equipment_id = ? 
+                    AND DATE(fl1.fueling_date) >= DATE('now', ?)
+                GROUP BY fl1.id
+                ORDER BY fl1.fueling_date
+                LIMIT 1
+            ''', (equipment_id, f'-{days} days'))
+            
+            result = await cursor.fetchone()
+            if result and result['end_odo'] and result['start_odo'] and result['fuel_used']:
+                km_traveled = result['end_odo'] - result['start_odo']
+                if km_traveled > 0 and result['fuel_used'] > 0:
+                    stats['avg_consumption'] = round((result['fuel_used'] / km_traveled) * 100, 2)  # л/100км
+                    stats['km_traveled'] = km_traveled
+            
+            await cursor.close()
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики топлива: {e}")
+        
+        return stats
+    
+    # ========== НОВЫЕ МЕТОДЫ ДЛЯ ЗАПЧАСТЕЙ ==========
+    
+    async def add_spare_part(self, organization_id: int, part_name: str, part_number: str = None,
+                           description: str = None, category: str = None, quantity: int = 0,
+                           min_quantity: int = 1, supplier: str = None, supplier_contact: str = None,
+                           unit_price: float = None, location: str = None, notes: str = None) -> Optional[int]:
+        """Добавляет запчасть в склад"""
+        try:
+            cursor = await self.conn.execute(
+                """INSERT INTO spare_parts 
+                (organization_id, part_name, part_number, description, category, 
+                 quantity, min_quantity, supplier, supplier_contact, unit_price, 
+                 location, notes) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (organization_id, part_name, part_number, description, category,
+                 quantity, min_quantity, supplier, supplier_contact, unit_price,
+                 location, notes)
+            )
+            await self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка добавления запчасти: {e}")
+            return None
+    
+    async def get_spare_parts(self, organization_id: int, category: str = None, 
+                            low_stock_only: bool = False) -> List[Dict]:
+        """Получает список запчастей"""
+        try:
+            query = "SELECT * FROM spare_parts WHERE organization_id = ?"
+            params = [organization_id]
+            
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+            
+            if low_stock_only:
+                query += " AND quantity <= min_quantity"
+            
+            query += " ORDER BY part_name"
+            
+            cursor = await self.conn.execute(query, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения запчастей: {e}")
+            return []
+    
+    async def update_spare_part_quantity(self, part_id: int, quantity_change: int) -> bool:
+        """Обновляет количество запчастей на складе"""
+        try:
+            await self.conn.execute(
+                "UPDATE spare_parts SET quantity = quantity + ? WHERE id = ?",
+                (quantity_change, part_id)
+            )
+            await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления количества запчастей: {e}")
+            return False
+    
+    # ========== НОВЫЕ МЕТОДЫ ДЛЯ ЗАКАЗОВ ==========
+    
+    async def create_order(self, organization_id: int, order_type: str, equipment_id: int = None,
+                         part_id: int = None, quantity: int = 1, urgent: bool = False,
+                         requested_by: int = None, notes: str = None) -> Optional[int]:
+        """Создает новый заказ"""
+        try:
+            cursor = await self.conn.execute(
+                """INSERT INTO orders 
+                (organization_id, order_type, equipment_id, part_id, quantity, 
+                 urgent, requested_by, notes) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (organization_id, order_type, equipment_id, part_id, quantity,
+                 urgent, requested_by, notes)
+            )
+            await self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка создания заказа: {e}")
+            return None
+    
+    async def get_orders(self, organization_id: int, status: str = None, 
+                       order_type: str = None) -> List[Dict]:
+        """Получает список заказов"""
+        try:
+            query = """
+                SELECT o.*, e.name as equipment_name, p.part_name,
+                u1.full_name as requested_by_name, u2.full_name as approved_by_name
+                FROM orders o
+                LEFT JOIN equipment e ON o.equipment_id = e.id
+                LEFT JOIN spare_parts p ON o.part_id = p.id
+                LEFT JOIN users u1 ON o.requested_by = u1.telegram_id
+                LEFT JOIN users u2 ON o.approved_by = u2.telegram_id
+                WHERE o.organization_id = ?
+            """
+            params = [organization_id]
+            
+            if status:
+                query += " AND o.status = ?"
+                params.append(status)
+            
+            if order_type:
+                query += " AND o.order_type = ?"
+                params.append(order_type)
+            
+            query += " ORDER BY o.created_at DESC"
+            
+            cursor = await self.conn.execute(query, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения заказов: {e}")
+            return []
+    
+    async def update_order_status(self, order_id: int, status: str, approved_by: int = None) -> bool:
+        """Обновляет статус заказа"""
+        try:
+            if approved_by:
+                await self.conn.execute(
+                    "UPDATE orders SET status = ?, approved_by = ? WHERE id = ?",
+                    (status, approved_by, order_id)
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE orders SET status = ? WHERE id = ?",
+                    (status, order_id)
+                )
+            
+            await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления статуса заказа: {e}")
+            return False
+    
+    # ========== НОВЫЕ МЕТОДЫ ДЛЯ ИНСТРУКЦИЙ ==========
+    
+    async def add_instruction(self, equipment_model: str, instruction_type: str, 
+                            title: str, description: str = None, steps: str = None,
+                            diagram_photo: str = None, video_url: str = None) -> Optional[int]:
+        """Добавляет инструкцию"""
+        try:
+            cursor = await self.conn.execute(
+                """INSERT INTO instructions 
+                (equipment_model, instruction_type, title, description, steps, 
+                 diagram_photo, video_url) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (equipment_model, instruction_type, title, description, steps,
+                 diagram_photo, video_url)
+            )
+            await self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка добавления инструкции: {e}")
+            return None
+    
+    async def get_instructions(self, equipment_model: str = None, 
+                             instruction_type: str = None) -> List[Dict]:
+        """Получает инструкции"""
+        try:
+            query = "SELECT * FROM instructions WHERE 1=1"
+            params = []
+            
+            if equipment_model:
+                query += " AND equipment_model LIKE ?"
+                params.append(f"%{equipment_model}%")
+            
+            if instruction_type:
+                query += " AND instruction_type = ?"
+                params.append(instruction_type)
+            
+            query += " ORDER BY title"
+            
+            cursor = await self.conn.execute(query, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения инструкций: {e}")
+            return []
+    
+    # ========== НОВЫЕ МЕТОДЫ ДЛЯ РАСШИРЕННОГО ТО ==========
+    
+    async def add_maintenance_schedule(self, equipment_id: int, maintenance_type: str,
+                                     interval_km: int = None, interval_days: int = None,
+                                     description: str = None, parts_needed: str = None,
+                                     estimated_hours: float = None) -> Optional[int]:
+        """Добавляет расписание ТО"""
+        try:
+            # Вычисляем следующую дату/пробег
+            next_due_km = None
+            next_due_date = None
+            
+            if interval_km:
+                equipment = await self.get_equipment_by_id(equipment_id)
+                if equipment and equipment.get('odometer'):
+                    next_due_km = equipment['odometer'] + interval_km
+            
+            if interval_days:
+                next_due_date = (datetime.now() + timedelta(days=interval_days)).strftime('%Y-%m-%d')
+            
+            cursor = await self.conn.execute(
+                """INSERT INTO maintenance_schedule 
+                (equipment_id, maintenance_type, interval_km, interval_days,
+                 last_done_km, last_done_date, next_due_km, next_due_date,
+                 description, parts_needed, estimated_hours) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (equipment_id, maintenance_type, interval_km, interval_days,
+                 0, None, next_due_km, next_due_date, description, 
+                 parts_needed, estimated_hours)
+            )
+            await self.conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка добавления расписания ТО: {e}")
+            return None
+    
+    async def get_upcoming_maintenance(self, organization_id: int, days_ahead: int = 30) -> List[Dict]:
+        """Получает предстоящие ТО"""
+        try:
+            query = """
+                SELECT ms.*, e.name as equipment_name, e.model, e.odometer,
+                       e.organization_id, o.name as org_name
+                FROM maintenance_schedule ms
+                JOIN equipment e ON ms.equipment_id = e.id
+                JOIN organizations o ON e.organization_id = o.id
+                WHERE e.organization_id = ? AND (
+                    (ms.next_due_date IS NOT NULL AND ms.next_due_date <= DATE('now', ?)) OR
+                    (ms.next_due_km IS NOT NULL AND ms.next_due_km <= e.odometer + ?)
+                )
+                ORDER BY ms.next_due_date, ms.next_due_km
+            """
+            params = [organization_id, f'+{days_ahead} days', 500]  # 500 км вперед
+            
+            cursor = await self.conn.execute(query, params)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения предстоящих ТО: {e}")
+            return []
+    
+    async def complete_maintenance(self, schedule_id: int, odometer: int = None) -> bool:
+        """Отмечает ТО как выполненное"""
+        try:
+            # Получаем данные о расписании
+            cursor = await self.conn.execute(
+                "SELECT * FROM maintenance_schedule WHERE id = ?",
+                (schedule_id,)
+            )
+            schedule = await cursor.fetchone()
+            await cursor.close()
+            
+            if not schedule:
+                return False
+            
+            # Обновляем последнее выполнение
+            update_query = """
+                UPDATE maintenance_schedule 
+                SET last_done_date = DATE('now'), last_done_km = ?
+            """
+            params = [odometer]
+            
+            # Вычисляем следующую дату/пробег
+            if schedule['interval_days']:
+                update_query += ", next_due_date = DATE('now', ?)"
+                params.append(f'+{schedule["interval_days"]} days')
+            
+            if schedule['interval_km'] and odometer:
+                update_query += ", next_due_km = ?"
+                params.append(odometer + schedule['interval_km'])
+            
+            update_query += " WHERE id = ?"
+            params.append(schedule_id)
+            
+            await self.conn.execute(update_query, params)
+            await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка завершения ТО: {e}")
+            return False
+    
+    # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
+    
+    async def get_equipment_by_id(self, equipment_id: int) -> Optional[Dict]:
+        """Получает технику по ID"""
+        try:
+            cursor = await self.conn.execute(
+                "SELECT * FROM equipment WHERE id = ?", 
+                (equipment_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Ошибка получения техники {equipment_id}: {e}")
+            return None
+    
+    async def get_low_fuel_equipment(self, organization_id: int, threshold: float = 20.0) -> List[Dict]:
+        """Получает технику с низким уровнем топлива"""
+        try:
+            cursor = await self.conn.execute('''
+                SELECT e.*, 
+                       (e.current_fuel_level / e.fuel_capacity * 100) as fuel_percentage
+                FROM equipment e
+                WHERE e.organization_id = ? 
+                  AND e.fuel_capacity > 0 
+                  AND e.current_fuel_level / e.fuel_capacity * 100 < ?
+                ORDER BY fuel_percentage
+            ''', (organization_id, threshold))
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения техники с низким топливом: {e}")
+            return []
+    
+    async def get_organization_analytics(self, org_id: int, period_days: int = 30) -> Dict:
+        """Получает аналитику организации"""
+        analytics = {}
+        try:
+            start_date = (datetime.now() - timedelta(days=period_days)).strftime('%Y-%m-%d')
+            
+            # Статистика по сменам
+            cursor = await self.conn.execute('''
+                SELECT COUNT(*) as total_shifts,
+                       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_shifts,
+                       AVG((julianday(end_time) - julianday(start_time)) * 24) as avg_shift_hours
+                FROM shifts s
+                JOIN users u ON s.driver_id = u.telegram_id
+                WHERE u.organization_id = ? AND s.start_time >= ?
+            ''', (org_id, start_date))
+            shift_stats = await cursor.fetchone()
+            analytics['shifts'] = dict(shift_stats) if shift_stats else {}
+            await cursor.close()
+            
+            # Статистика по топливу
+            cursor = await self.conn.execute('''
+                SELECT SUM(fl.fuel_amount) as total_fuel,
+                       SUM(fl.total_cost) as total_fuel_cost,
+                       AVG(fl.cost_per_liter) as avg_fuel_price
+                FROM fuel_logs fl
+                JOIN equipment e ON fl.equipment_id = e.id
+                WHERE e.organization_id = ? AND DATE(fl.fueling_date) >= ?
+            ''', (org_id, start_date))
+            fuel_stats = await cursor.fetchone()
+            analytics['fuel'] = dict(fuel_stats) if fuel_stats else {}
+            await cursor.close()
+            
+            # Статистика по ТО
+            cursor = await self.conn.execute('''
+                SELECT COUNT(*) as total_maintenance,
+                       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_maintenance,
+                       SUM(cost) as total_maintenance_cost
+                FROM maintenance m
+                JOIN equipment e ON m.equipment_id = e.id
+                WHERE e.organization_id = ? AND m.created_at >= ?
+            ''', (org_id, start_date))
+            maintenance_stats = await cursor.fetchone()
+            analytics['maintenance'] = dict(maintenance_stats) if maintenance_stats else {}
+            await cursor.close()
+            
+            # Техника по статусам
+            cursor = await self.conn.execute('''
+                SELECT status, COUNT(*) as count
+                FROM equipment
+                WHERE organization_id = ?
+                GROUP BY status
+            ''', (org_id,))
+            status_data = await cursor.fetchall()
+            analytics['equipment_by_status'] = {row['status']: row['count'] for row in status_data}
+            await cursor.close()
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения аналитики организации {org_id}: {e}")
+        
+        return analytics
+    
+    # ========== СУЩЕСТВУЮЩИЕ МЕТОДЫ (с минимальными изменениями) ==========
     
     async def get_user(self, telegram_id: int) -> Optional[Dict]:
         """Получает пользователя по Telegram ID"""
@@ -271,8 +1007,6 @@ class Database:
             logger.error(f"Ошибка получения пользователей организации {org_id}: {e}")
             return []
     
-    # ========== ОРГАНИЗАЦИИ ==========
-    
     async def get_organization(self, org_id: int) -> Optional[Dict]:
         """Получает организацию по ID"""
         try:
@@ -287,22 +1021,19 @@ class Database:
             logger.error(f"Ошибка получения организации {org_id}: {e}")
             return None
     
-    async def create_organization_for_director(self, director_id: int, org_name: str):
+    async def create_organization_for_director(self, director_id: int, org_name: str, address: str = None, contact_phone: str = None):
         """Создает организацию и назначает директора"""
         try:
-            # Проверяем, что у директора еще нет организации
             user = await self.get_user(director_id)
             if user and user.get('organization_id'):
                 return None, "У этого пользователя уже есть организация"
             
-            # Создаем организацию
             cursor = await self.conn.execute(
-                "INSERT INTO organizations (name, director_id) VALUES (?, ?)",
-                (org_name, director_id)
+                "INSERT INTO organizations (name, director_id, address, contact_phone) VALUES (?, ?, ?, ?)",
+                (org_name, director_id, address, contact_phone)
             )
             org_id = cursor.lastrowid
             
-            # Обновляем пользователя
             await self.conn.execute(
                 "UPDATE users SET organization_id = ?, role = 'director' WHERE telegram_id = ?",
                 (org_id, director_id)
@@ -342,7 +1073,6 @@ class Database:
         """Получает статистику организации"""
         stats = {}
         try:
-            # Количество пользователей по ролям
             cursor = await self.conn.execute(
                 "SELECT role, COUNT(*) as count FROM users WHERE organization_id = ? GROUP BY role",
                 (org_id,)
@@ -351,7 +1081,6 @@ class Database:
             stats['roles'] = {row['role']: row['count'] for row in roles_data}
             await cursor.close()
             
-            # Количество техники по статусам
             cursor = await self.conn.execute(
                 "SELECT status, COUNT(*) as count FROM equipment WHERE organization_id = ? GROUP BY status",
                 (org_id,)
@@ -360,7 +1089,6 @@ class Database:
             stats['equipment'] = {row['status']: row['count'] for row in eq_data}
             await cursor.close()
             
-            # Активные смены
             cursor = await self.conn.execute('''
                 SELECT COUNT(*) as count FROM shifts s
                 JOIN users u ON s.driver_id = u.telegram_id
@@ -370,7 +1098,6 @@ class Database:
             stats['active_shifts'] = active_shifts['count'] if active_shifts else 0
             await cursor.close()
             
-            # ТО на следующую неделю
             next_week = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
             cursor = await self.conn.execute('''
                 SELECT COUNT(*) as count FROM maintenance m
@@ -386,14 +1113,16 @@ class Database:
         
         return stats
     
-    # ========== ТЕХНИКА ==========
-    
-    async def add_equipment(self, name: str, model: str, vin: str, org_id: int) -> Optional[int]:
+    async def add_equipment(self, name: str, model: str, vin: str, org_id: int, 
+                          registration_number: str = None, fuel_type: str = 'diesel',
+                          fuel_capacity: float = None) -> Optional[int]:
         """Добавляет новую технику"""
         try:
             cursor = await self.conn.execute(
-                "INSERT INTO equipment (name, model, vin, organization_id) VALUES (?, ?, ?, ?)",
-                (name, model, vin, org_id)
+                """INSERT INTO equipment 
+                (name, model, vin, organization_id, registration_number, fuel_type, fuel_capacity) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, model, vin, org_id, registration_number, fuel_type, fuel_capacity)
             )
             await self.conn.commit()
             return cursor.lastrowid
@@ -451,14 +1180,12 @@ class Database:
             logger.error(f"Ошибка обновления техники {eq_id}: {e}")
             return False
     
-    # ========== СМЕНЫ ==========
-    
-    async def start_shift(self, driver_id: int, equipment_id: int, briefing_confirmed: bool = False) -> Optional[int]:
+    async def start_shift(self, driver_id: int, equipment_id: int, briefing_confirmed: bool = False, start_odometer: int = None) -> Optional[int]:
         """Начинает новую смену"""
         try:
             cursor = await self.conn.execute(
-                "INSERT INTO shifts (driver_id, equipment_id, briefing_confirmed) VALUES (?, ?, ?)",
-                (driver_id, equipment_id, briefing_confirmed)
+                "INSERT INTO shifts (driver_id, equipment_id, briefing_confirmed, start_odometer) VALUES (?, ?, ?, ?)",
+                (driver_id, equipment_id, briefing_confirmed, start_odometer)
             )
             await self.conn.commit()
             return cursor.lastrowid
@@ -470,7 +1197,7 @@ class Database:
         """Получает активную смену водителя"""
         try:
             cursor = await self.conn.execute('''
-                SELECT s.*, e.name as equipment_name 
+                SELECT s.*, e.name as equipment_name, e.odometer
                 FROM shifts s
                 LEFT JOIN equipment e ON s.equipment_id = e.id
                 WHERE s.driver_id = ? AND s.status = 'active'
@@ -522,13 +1249,31 @@ class Database:
             logger.error(f"Ошибка добавления проверки для смены {shift_id}: {e}")
             return False
     
-    async def complete_shift(self, shift_id: int, notes: str = None) -> bool:
+    async def complete_shift(self, shift_id: int, end_odometer: int = None, notes: str = None) -> bool:
         """Завершает смену"""
         try:
             await self.conn.execute(
-                "UPDATE shifts SET end_time = CURRENT_TIMESTAMP, status = 'completed', notes = ? WHERE id = ?",
-                (notes, shift_id)
+                """UPDATE shifts SET end_time = CURRENT_TIMESTAMP, 
+                status = 'completed', end_odometer = ?, notes = ? 
+                WHERE id = ?""",
+                (end_odometer, notes, shift_id)
             )
+            
+            # Обновляем одометр в технике
+            if end_odometer:
+                cursor = await self.conn.execute(
+                    "SELECT equipment_id FROM shifts WHERE id = ?",
+                    (shift_id,)
+                )
+                shift = await cursor.fetchone()
+                await cursor.close()
+                
+                if shift:
+                    await self.conn.execute(
+                        "UPDATE equipment SET odometer = ? WHERE id = ?",
+                        (end_odometer, shift['equipment_id'])
+                    )
+            
             await self.conn.commit()
             return True
         except Exception as e:
@@ -587,8 +1332,6 @@ class Database:
             logger.error(f"Ошибка подтверждения осмотра {shift_id}: {e}")
             return False
     
-    # ========== ТЕХНИЧЕСКОЕ ОБСЛУЖИВАНИЕ ==========
-    
     async def add_maintenance(self, equipment_id: int, type: str, scheduled_date: str, description: str = None) -> Optional[int]:
         """Добавляет запись о ТО"""
         try:
@@ -598,7 +1341,6 @@ class Database:
             )
             await self.conn.commit()
             
-            # Обновляем дату следующего ТО в технике
             await self.conn.execute(
                 "UPDATE equipment SET next_maintenance = ? WHERE id = ?",
                 (scheduled_date, equipment_id)
@@ -609,8 +1351,6 @@ class Database:
         except Exception as e:
             logger.error(f"Ошибка добавления ТО: {e}")
             return None
-    
-    # ========== ЖУРНАЛ ДЕЙСТВИЙ ==========
     
     async def log_action(self, user_id: int, action_type: str, details: str = None) -> bool:
         """Логирует действие пользователя"""
@@ -653,15 +1393,12 @@ class Database:
             logger.error(f"Ошибка получения действий: {e}")
             return []
     
-    # ========== СТАТИСТИКА ==========
-    
     async def get_driver_stats(self, driver_id: int, days: int = 30) -> Dict:
         """Получает статистику водителя"""
         stats = {}
         try:
             start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
             
-            # Количество смен
             cursor = await self.conn.execute('''
                 SELECT COUNT(*) as count FROM shifts 
                 WHERE driver_id = ? AND start_time >= ? AND status = 'completed'
@@ -670,7 +1407,6 @@ class Database:
             stats['shifts_count'] = result['count'] if result else 0
             await cursor.close()
             
-            # Средняя продолжительность смены
             cursor = await self.conn.execute('''
                 SELECT AVG((julianday(end_time) - julianday(start_time)) * 24) as avg_hours
                 FROM shifts 
@@ -680,7 +1416,6 @@ class Database:
             stats['avg_shift_hours'] = round(result['avg_hours'], 1) if result and result['avg_hours'] else 0
             await cursor.close()
             
-            # Количество разной использованной техники
             cursor = await self.conn.execute('''
                 SELECT COUNT(DISTINCT equipment_id) as count FROM shifts 
                 WHERE driver_id = ? AND start_time >= ? AND status = 'completed'
