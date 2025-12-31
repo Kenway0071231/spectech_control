@@ -2,6 +2,8 @@ import os
 import logging
 import asyncio
 import json
+import base64
+import re
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -13,35 +15,198 @@ from datetime import datetime, timedelta
 import aioschedule
 from dotenv import load_dotenv
 import aiohttp
-from typing import Optional, Dict, List
-
+from typing import Optional, Dict, List, Any
+ 
 from database import db
-
+ 
 # ========== НАСТРОЙКА ==========
 load_dotenv()
-
+ 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
+ 
 # Настройки ИИ
 AI_ENABLED = os.getenv('AI_ENABLED', 'False').lower() == 'true'
 YANDEX_API_KEY = os.getenv('YANDEX_API_KEY', '')
 YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID', '')
 YANDEX_GPT_MODEL = os.getenv('YANDEX_GPT_MODEL', 'yandexgpt-lite')
-
+VISION_API_KEY = os.getenv('VISION_API_KEY', YANDEX_API_KEY)
+VISION_FOLDER_ID = os.getenv('VISION_FOLDER_ID', YANDEX_FOLDER_ID)
+ 
 # Инициализация бота
 bot = Bot(
     token=os.getenv('BOT_TOKEN'),
     default=DefaultBotProperties(parse_mode="HTML")
 )
-
+ 
 # Инициализация диспетчера
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
+ 
+# ========== КЛАСС ДЛЯ АНАЛИЗА ИЗОБРАЖЕНИЙ ==========
+class YandexVisionAnalyzer:
+    def __init__(self):
+        self.api_key = VISION_API_KEY
+        self.folder_id = VISION_FOLDER_ID
+        self.base_url = "https://vision.api.cloud.yandex.net/vision/v1/"
+    
+    async def analyze_image(self, image_bytes: bytes, feature_type: str = "TEXT_DETECTION") -> Dict[str, Any]:
+        """Анализирует изображение с помощью Yandex Vision API"""
+        try:
+            if not self.api_key or not self.folder_id:
+                logger.error("Yandex Vision не настроен: отсутствует API ключ или Folder ID")
+                return {"error": "Yandex Vision не настроен"}
+            
+            # Кодируем изображение в base64
+            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            
+            # Формируем запрос
+            url = f"{self.base_url}batchAnalyze"
+            
+            headers = {
+                "Authorization": f"Api-Key {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "folderId": self.folder_id,
+                "analyzeSpecs": [{
+                    "content": image_base64,
+                    "features": [{
+                        "type": feature_type,
+                        "textDetectionConfig": {
+                            "languageCodes": ["ru", "en"]
+                        }
+                    }]
+                }]
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=data, timeout=30) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return self._process_vision_result(result, feature_type)
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Ошибка Vision API: {response.status} - {error_text}")
+                        return {"error": f"Ошибка API: {response.status}"}
+                        
+        except Exception as e:
+            logger.error(f"Ошибка анализа изображения: {e}")
+            return {"error": str(e)}
+    
+    def _process_vision_result(self, result: Dict, feature_type: str) -> Dict:
+        """Обрабатывает результат Vision API"""
+        if feature_type == "TEXT_DETECTION":
+            return self._extract_text(result)
+        else:
+            return result
+    
+    def _extract_text(self, result: Dict) -> Dict:
+        """Извлекает текст из результата Vision API"""
+        try:
+            extracted_text = ""
+            
+            # Проходим по всем уровням вложенности результата
+            for result_item in result.get('results', []):
+                for analysis_result in result_item.get('results', []):
+                    text_detection = analysis_result.get('textDetection', {})
+                    
+                    for page in text_detection.get('pages', []):
+                        for block in page.get('blocks', []):
+                            for line in block.get('lines', []):
+                                line_text = ""
+                                for word in line.get('words', []):
+                                    line_text += word.get('text', '') + ' '
+                                extracted_text += line_text.strip() + '\n'
+            
+            return {
+                "success": True,
+                "extracted_text": extracted_text.strip()
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка извлечения текста: {e}")
+            return {"error": f"Ошибка обработки: {e}"}
+    
+    async def analyze_document(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Специальный метод для анализа документов (СТС/ПТС)"""
+        result = await self.analyze_image(image_bytes, "TEXT_DETECTION")
+        
+        if "extracted_text" in result:
+            # Очищаем текст от мусора
+            text = result["extracted_text"]
+            
+            # Ищем ключевые поля документа
+            document_info = self._parse_document_text(text)
+            
+            result.update({
+                "document_info": document_info,
+                "is_document": self._is_likely_document(text)
+            })
+        
+        return result
+    
+    def _parse_document_text(self, text: str) -> Dict[str, str]:
+        """Пытается найти ключевые поля в тексте документа"""
+        info = {}
+        
+        # Поиск VIN (17 символов, буквы и цифры)
+        vin_pattern = r'[A-HJ-NPR-Z0-9]{17}'
+        vin_match = re.search(vin_pattern, text.upper())
+        if vin_match:
+            info['vin'] = vin_match.group(0)
+        
+        # Поиск госномера (русские буквы, цифры)
+        plate_pattern = r'[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}'
+        plate_match = re.search(plate_pattern, text.upper())
+        if plate_match:
+            info['registration_number'] = plate_match.group(0)
+        
+        # Поиск года
+        year_pattern = r'\b(19[0-9]{2}|20[0-2][0-9])\b'
+        year_match = re.search(year_pattern, text)
+        if year_match:
+            info['year'] = year_match.group(0)
+        
+        # Простые поиски по ключевым словам
+        lines = text.split('\n')
+        for line in lines:
+            if 'МОДЕЛЬ' in line.upper() or 'MODEL' in line.upper():
+                parts = line.split(':')
+                if len(parts) > 1:
+                    info['model'] = parts[1].strip()
+                else:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        info['model'] = parts[-1].strip()
+            
+            if 'МАРКА' in line.upper() or 'BRAND' in line.upper():
+                parts = line.split(':')
+                if len(parts) > 1:
+                    info['brand'] = parts[1].strip()
+                else:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        info['brand'] = parts[-1].strip()
+        
+        return info
+    
+    def _is_likely_document(self, text: str) -> bool:
+        """Определяет, похож ли текст на документ"""
+        keywords = ['ПТС', 'СТС', 'VIN', 'МОДЕЛЬ', 'ГОС', 'НОМЕР', 'РЕГИСТРАЦИЯ', 'PTS', 'STS']
+        text_upper = text.upper()
+        
+        # Если есть хотя бы 2 ключевых слова
+        found_keywords = sum(1 for keyword in keywords if keyword in text_upper)
+        return found_keywords >= 2
+ 
+# Создаем глобальный экземпляр анализатора
+vision_analyzer = YandexVisionAnalyzer()
+ 
 # ========== СОСТОЯНИЯ ==========
 class UserStates(StatesGroup):
     # Основные состояния
@@ -71,16 +236,31 @@ class UserStates(StatesGroup):
     # Для завершения смены
     waiting_for_end_odometer = State()
     waiting_for_shift_notes = State()
-
+    
+    # Для регистрации техники с ИИ
+    waiting_for_document_photo = State()
+    waiting_for_document_analysis = State()
+    waiting_for_motohours = State()
+    waiting_for_last_service = State()
+    waiting_for_equipment_type = State()
+    waiting_for_equipment_name = State()
+    
+    # Для анализа фото
+    waiting_for_panel_photo = State()
+    waiting_for_refuel_photo = State()
+    
+    # Для ежедневного инструктажа
+    waiting_for_briefing_response = State()
+ 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
+ 
 async def log_user_action(user_id, action_type, details=""):
     """Логирует действие пользователя"""
     try:
         await db.log_action(user_id, action_type, details)
     except Exception as e:
         logger.error(f"Ошибка логирования действия: {e}")
-
+ 
 async def send_typing(chat_id):
     """Показывает 'печатает...'"""
     try:
@@ -88,19 +268,19 @@ async def send_typing(chat_id):
         await asyncio.sleep(0.1)
     except:
         pass
-
+ 
 async def reply(message, text, **kwargs):
     """Отправляет сообщение с индикатором набора"""
     await send_typing(message.chat.id)
     return await message.answer(text, **kwargs)
-
+ 
 async def send_to_user(user_id, text, **kwargs):
     """Отправляет сообщение пользователю по ID"""
     try:
         await bot.send_message(user_id, text, **kwargs)
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-
+ 
 async def ask_yandex_gpt(question: str, context: str = "", user_id: int = None) -> str:
     """Взаимодействие с Yandex GPT"""
     try:
@@ -166,13 +346,82 @@ async def ask_yandex_gpt(question: str, context: str = "", user_id: int = None) 
     except Exception as e:
         logger.error(f"Ошибка Yandex GPT: {e}")
         return "⚠️ Произошла ошибка при обработке запроса. Попробуйте еще раз или обратитесь к специалисту."
-
+ 
+async def analyze_image_with_ai(image_bytes: bytes, analysis_type: str = "document") -> Dict:
+    """
+    Анализирует изображение с помощью ИИ
+    analysis_type: "document", "panel", "inspection", "fuel"
+    """
+    try:
+        if analysis_type == "document":
+            result = await vision_analyzer.analyze_document(image_bytes)
+        else:
+            result = await vision_analyzer.analyze_image(image_bytes)
+        
+        # Если есть текст, отправляем его в GPT для обработки
+        if "extracted_text" in result:
+            # Используем GPT для структурирования информации
+            prompt = f"""
+            Проанализируй этот текст, извлеченный из {analysis_type}:
+            
+            {result['extracted_text'][:2000]}
+            
+            Извлеки структурированную информацию.
+            """
+            
+            if analysis_type == "document":
+                prompt += """
+                Верни JSON с полями:
+                - model (модель)
+                - brand (марка)
+                - vin (VIN номер)
+                - registration_number (госномер)
+                - year (год)
+                - category (тип техники)
+                - engine_power (мощность)
+                - color (цвет)
+                """
+            
+            elif analysis_type == "panel":
+                prompt += """
+                Верни JSON с полями:
+                - odometer (пробег в км)
+                - fuel_level (уровень топлива если есть)
+                - warnings (предупреждения если есть)
+                - notes (заметки)
+                """
+            
+            gpt_response = await ask_yandex_gpt(prompt, "")
+            
+            # Пытаемся найти JSON в ответе
+            json_match = re.search(r'\{.*\}', gpt_response, re.DOTALL)
+            
+            if json_match:
+                try:
+                    gpt_data = json.loads(json_match.group(0))
+                    result["ai_analysis"] = gpt_data
+                except:
+                    result["ai_analysis"] = {"raw_response": gpt_response}
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка анализа изображения с ИИ: {e}")
+        return {"error": str(e)}
+ 
 async def ask_ai_assistant(question: str, context: str = "", user_id: int = None) -> str:
     """Взаимодействие с ИИ для помощи по технике"""
     if not AI_ENABLED:
         return "🤖 Функция ИИ-помощника временно недоступна. Обратитесь к начальнику парка."
     
     try:
+        # Проверяем, имеет ли пользователь доступ к ИИ
+        if user_id:
+            user = await db.get_user(user_id)
+            allowed_roles = ['botadmin', 'director', 'fleetmanager', 'driver']
+            if user and user['role'] not in allowed_roles:
+                return "⛔ Доступ к ИИ-помощнику только для назначенных пользователей."
+        
         if YANDEX_API_KEY and YANDEX_FOLDER_ID:
             return await ask_yandex_gpt(question, context, user_id)
         
@@ -194,7 +443,7 @@ async def ask_ai_assistant(question: str, context: str = "", user_id: int = None
     except Exception as e:
         logger.error(f"Ошибка ИИ ассистента: {e}")
         return "⚠️ Произошла ошибка при обработке запроса."
-
+ 
 def get_main_keyboard(role, has_organization=False):
     """Генерирует клавиатуру в зависимости от роли"""
     
@@ -238,7 +487,7 @@ def get_main_keyboard(role, has_organization=False):
                     [types.KeyboardButton(text="🏢 Моя организация")],
                     [types.KeyboardButton(text="🚜 Автопарк")],
                     [types.KeyboardButton(text="👥 Сотрудники")],
-                    [types.KeyboardButton(text="➕ Добавить технику")],
+                    [types.KeyboardButton(text="📷 Зарегистрировать технику")],
                     [types.KeyboardButton(text="➕ Назначить сотрудника")],
                     [types.KeyboardButton(text="📊 Статистика")],
                     [types.KeyboardButton(text="⛽ Учет топлива")],
@@ -280,7 +529,7 @@ def get_main_keyboard(role, has_organization=False):
                 resize_keyboard=True
             )
         else:
-            active_shift = asyncio.run(db.get_active_shift(user_id))
+            active_shift = asyncio.run(db.get_active_shift(message.from_user.id))
             if active_shift:
                 return types.ReplyKeyboardMarkup(
                     keyboard=[
@@ -311,14 +560,14 @@ def get_main_keyboard(role, has_organization=False):
         ],
         resize_keyboard=True
     )
-
+ 
 def get_cancel_keyboard():
     """Клавиатура с кнопкой отмена"""
     return types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True
     )
-
+ 
 def get_yes_no_keyboard():
     """Клавиатура Да/Нет"""
     return types.ReplyKeyboardMarkup(
@@ -328,7 +577,7 @@ def get_yes_no_keyboard():
         ],
         resize_keyboard=True
     )
-
+ 
 def get_fuel_type_keyboard():
     """Клавиатура для выбора типа топлива"""
     return types.ReplyKeyboardMarkup(
@@ -340,7 +589,7 @@ def get_fuel_type_keyboard():
         ],
         resize_keyboard=True
     )
-
+ 
 # ========== КОМАНДА СТАРТ (ПОЛНОСТЬЮ ПЕРЕРАБОТАНА) ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -355,7 +604,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             username=message.from_user.username
         )
         user = await db.get_user(message.from_user.id)
-
+ 
     if not user:
         await reply(message, "❌ Ошибка регистрации. Попробуйте еще раз.")
         return
@@ -417,11 +666,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
         welcome_text += "Для ускорения отправьте ваш ID директору"
     
     await reply(message, welcome_text, reply_markup=get_main_keyboard(role, has_organization))
-
+ 
 # ========== ИИ ПОМОЩНИК ==========
 @dp.message(F.text == "🤖 ИИ Помощник")
 async def ai_assistant_start(message: types.Message, state: FSMContext):
     """Начинает диалог с ИИ помощником"""
+    user = await db.get_user(message.from_user.id)
+    
+    # Проверяем роль
+    allowed_roles = ['botadmin', 'director', 'fleetmanager', 'driver']
+    if user['role'] not in allowed_roles:
+        await reply(message, "⛔ Доступ к ИИ-помощнику только для назначенных пользователей.")
+        return
+    
     await reply(
         message,
         "🤖 <b>ИИ Помощник по обслуживанию техники</b>\n\n"
@@ -439,7 +696,7 @@ async def ai_assistant_start(message: types.Message, state: FSMContext):
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_ai_question)
-
+ 
 @dp.message(UserStates.waiting_for_ai_question)
 async def process_ai_question(message: types.Message, state: FSMContext):
     """Обрабатывает вопрос к ИИ"""
@@ -486,7 +743,7 @@ async def process_ai_question(message: types.Message, state: FSMContext):
     user = await db.get_user(message.from_user.id)
     await reply(message, "Возврат в главное меню", 
                reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-
+ 
 # ========== ИНФОРМАЦИЯ О БОТЕ ==========
 @dp.message(F.text == "ℹ️ Информация о боте")
 async def bot_info(message: types.Message):
@@ -498,28 +755,28 @@ async def bot_info(message: types.Message):
         "• Управление сменами водителей\n"
         "• Контроль ТО и обслуживания\n"
         "• Учет топлива и аналитика\n"
-        "• ИИ-помощник по обслуживанию\n\n"
+        "• ИИ-помощник по обслуживанию\n"
+        "• 📷 Анализ документов (СТС/ПТС)\n"
+        "• 🔍 Контроль ежедневных осмотров\n\n"
         "👥 <b>Роли в системе:</b>\n"
         "• 🚛 Водитель - работа со сменами\n"
         "• 👷 Начальник парка - управление техникой\n"
         "• 👨‍💼 Директор - управление организацией\n"
         "• 👑 Администратор - управление системой\n\n"
-        "📞 <b>Поддержка:</b>\n"
-        "Для получения доступа отправьте ваш ID вышестоящему сотруднику.\n"
-        "ID можно узнать через команду /start\n\n"
+        "📞 <b>Техническая поддержка:</b> @Sekynds\n\n"
         "🚀 <b>Разработка:</b>\n"
         "Бот постоянно улучшается. Следите за обновлениями!"
     )
     
     await reply(message, info_text)
-
+ 
 # ========== КОНТАКТЫ ==========
 @dp.message(F.text == "📞 Контакты")
 async def contacts(message: types.Message):
     """Показывает контакты"""
     contacts_text = (
         "📞 <b>Контакты</b>\n\n"
-        "<b>Техническая поддержка:</b>\n"
+        "<b>Техническая поддержка:</b> @Sekynds\n"
         "• По вопросам работы бота\n"
         "• По проблемам с доступом\n"
         "• По предложениям по улучшению\n\n"
@@ -531,7 +788,300 @@ async def contacts(message: types.Message):
     )
     
     await reply(message, contacts_text)
+ 
+# ========== РЕГИСТРАЦИЯ ТЕХНИКИ С ИИ ==========
+@dp.message(F.text == "📷 Зарегистрировать технику")
+async def register_equipment_with_photo(message: types.Message, state: FSMContext):
+    """Начинает регистрацию техники с помощью фото"""
+    user = await db.get_user(message.from_user.id)
+    
+    if user['role'] not in ['director', 'fleetmanager']:
+        await reply(message, "⛔ Только руководители могут регистрировать технику!")
+        return
+    
+    if not user.get('organization_id'):
+        await reply(message, "❌ Вы не привязаны к организации!")
+        return
+    
+    await reply(
+        message,
+        "🚜 <b>Регистрация новой техники</b>\n\n"
+        "📸 <b>Шаг 1 из 5:</b> Отправьте фото СТС или ПТС\n\n"
+        "ИИ автоматически считает все данные:\n"
+        "• VIN номер\n• Модель\n• Госномер\n• Год выпуска\n\n"
+        "<i>Сфотографируйте документ и отправьте фото</i>",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_document_photo)
 
+@dp.message(UserStates.waiting_for_document_photo, F.photo)
+async def process_document_photo(message: types.Message, state: FSMContext):
+    """Обрабатывает фото документа"""
+    try:
+        await reply(message, "🔍 <b>Анализирую документ...</b>\n\nИИ обрабатывает изображение...")
+        
+        # Скачиваем фото
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        photo_bytes = await bot.download_file(file.file_path)
+        
+        # Анализируем документ
+        analysis = await analyze_image_with_ai(await photo_bytes.read(), "document")
+        
+        if "error" in analysis:
+            await reply(
+                message,
+                f"❌ <b>Ошибка анализа:</b> {analysis['error']}\n\n"
+                "Попробуйте еще раз или введите данные вручную.",
+                reply_markup=get_cancel_keyboard()
+            )
+            return
+        
+        # Сохраняем результат
+        await state.update_data(
+            document_photo_id=photo.file_id,
+            document_analysis=analysis
+        )
+        
+        # Показываем результат
+        info_text = "✅ <b>ИИ распознал данные:</b>\n\n"
+        
+        if "ai_analysis" in analysis:
+            data = analysis["ai_analysis"]
+            info_text += f"🚜 <b>Модель:</b> {data.get('model', 'Не распознано')}\n"
+            info_text += f"🏷️ <b>Марка:</b> {data.get('brand', 'Не распознано')}\n"
+            info_text += f"🔢 <b>VIN:</b> {data.get('vin', 'Не распознано')}\n"
+            info_text += f"🚗 <b>Госномер:</b> {data.get('registration_number', 'Не распознано')}\n"
+            info_text += f"📅 <b>Год:</b> {data.get('year', 'Не распознано')}\n"
+            if data.get('category'):
+                info_text += f"🏗️ <b>Тип:</b> {data.get('category', 'Не распознано')}\n"
+        
+        info_text += "\n<b>Продолжить регистрацию этой техники?</b>"
+        
+        keyboard = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="✅ Да, продолжить")],
+                [types.KeyboardButton(text="🔄 Нет, отправить другое фото")],
+                [types.KeyboardButton(text="❌ Отмена")]
+            ],
+            resize_keyboard=True
+        )
+        
+        await reply(message, info_text, reply_markup=keyboard)
+        await state.set_state(UserStates.waiting_for_document_analysis)
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки фото документа: {e}")
+        await reply(message, "❌ Ошибка при обработке фото. Попробуйте еще раз.")
+
+@dp.message(UserStates.waiting_for_document_analysis)
+async def process_document_confirmation(message: types.Message, state: FSMContext):
+    """Обрабатывает подтверждение данных документа"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Регистрация отменена",
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    if message.text == "🔄 Нет, отправить другое фото":
+        await reply(
+            message,
+            "🔄 <b>Отправьте новое фото документа</b>\n\n"
+            "Убедитесь, что:\n"
+            "1. Фото четкое\n"
+            "2. Весь документ в кадре\n"
+            "3. Хорошее освещение",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.set_state(UserStates.waiting_for_document_photo)
+        return
+    
+    if message.text == "✅ Да, продолжить":
+        # Запрашиваем дополнительные данные
+        await reply(
+            message,
+            "📊 <b>Шаг 2 из 5:</b> Дополнительная информация\n\n"
+            "Введите текущие моточасы техники:\n"
+            "<i>Например: 1250</i>",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.set_state(UserStates.waiting_for_motohours)
+
+@dp.message(UserStates.waiting_for_motohours)
+async def process_motohours(message: types.Message, state: FSMContext):
+    """Обрабатывает ввод моточасов"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Регистрация отменена",
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    try:
+        motohours = int(message.text)
+        await state.update_data(motohours=motohours)
+        
+        await reply(
+            message,
+            "🛠️ <b>Шаг 3 из 5:</b> Последнее ТО\n\n"
+            "Введите, что делалось на последнем ТО:\n"
+            "<i>Например: Замена масла, фильтров 01.12.2023</i>",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.set_state(UserStates.waiting_for_last_service)
+        
+    except ValueError:
+        await reply(message, "❌ Введите число! Например: 1250")
+
+@dp.message(UserStates.waiting_for_last_service)
+async def process_last_service(message: types.Message, state: FSMContext):
+    """Обрабатывает ввод данных о последнем ТО"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Регистрация отменена",
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    await state.update_data(last_service=message.text)
+    
+    # Запрашиваем тип техники
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🚜 Экскаватор")],
+            [types.KeyboardButton(text="🚚 Погрузчик")],
+            [types.KeyboardButton(text="🏗️ Бульдозер")],
+            [types.KeyboardButton(text="🚛 Самосвал")],
+            [types.KeyboardButton(text="🚒 Кран")],
+            [types.KeyboardButton(text="🔄 Другое")],
+            [types.KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await reply(
+        message,
+        "🏗️ <b>Шаг 4 из 5:</b> Тип техники\n\n"
+        "Выберите тип техники:",
+        reply_markup=keyboard
+    )
+    await state.set_state(UserStates.waiting_for_equipment_type)
+
+@dp.message(UserStates.waiting_for_equipment_type)
+async def process_equipment_type(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор типа техники"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Регистрация отменена",
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    equipment_type = message.text.replace("🚜", "").replace("🚚", "").replace("🏗️", "").replace("🚛", "").replace("🚒", "").replace("🔄", "").strip()
+    
+    await state.update_data(equipment_type=equipment_type)
+    
+    # Запрашиваем имя/название техники
+    await reply(
+        message,
+        "🏷️ <b>Шаг 5 из 5:</b> Название техники\n\n"
+        "Введите имя для техники (для удобства):\n"
+        "<i>Например: Экскаватор №1, Волга-2023, Синий кран</i>",
+        reply_markup=get_cancel_keyboard()
+    )
+    
+    await state.set_state(UserStates.waiting_for_equipment_name)
+
+@dp.message(UserStates.waiting_for_equipment_name)
+async def finalize_equipment_registration(message: types.Message, state: FSMContext):
+    """Завершает регистрацию техники"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = await db.get_user(message.from_user.id)
+        await reply(message, "❌ Регистрация отменена",
+                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
+        return
+    
+    equipment_name = message.text
+    data = await state.get_data()
+    user = await db.get_user(message.from_user.id)
+    
+    # Собираем все данные
+    document_data = data.get('document_analysis', {}).get('ai_analysis', {})
+    
+    # Если нет данных от ИИ, используем ручной ввод
+    model = document_data.get('model', 'Неизвестная модель')
+    if model == 'Не распознано':
+        model = f"Техника {equipment_name}"
+    
+    vin = document_data.get('vin', 'Неизвестно')
+    if vin == 'Не распознано':
+        vin = f"TEMP_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    
+    # Добавляем технику в базу
+    equipment_id = await db.add_equipment(
+        name=equipment_name,
+        model=model,
+        vin=vin,
+        org_id=user['organization_id'],
+        registration_number=document_data.get('registration_number', 'Без номера'),
+        fuel_type='diesel',
+        fuel_capacity=300
+    )
+    
+    if equipment_id:
+        # Добавляем моточасы
+        await db.update_equipment(equipment_id, odometer=data.get('motohours', 0))
+        
+        # Сохраняем фото документа
+        await db.log_action(
+            user_id=message.from_user.id,
+            action_type="equipment_registered_with_photo",
+            details=f"Техника {equipment_name} зарегистрирована. VIN: {vin}"
+        )
+        
+        # Сохраняем информацию для ИИ
+        ai_context = f"""
+        Новая техника зарегистрирована:
+        - Название: {equipment_name}
+        - Модель: {model}
+        - Тип: {data.get('equipment_type', 'Не указано')}
+        - Моточасы: {data.get('motohours', 0)}
+        - Последнее ТО: {data.get('last_service', 'Не указано')}
+        - VIN: {vin}
+        """
+        
+        await db.add_ai_context(
+            organization_id=user['organization_id'],
+            context_type="equipment_registration",
+            equipment_model=model,
+            question="Регистрация новой техники",
+            answer=ai_context,
+            source="bot_auto"
+        )
+        
+        await reply(
+            message,
+            f"✅ <b>Техника успешно зарегистрирована!</b>\n\n"
+            f"🏷️ <b>Название:</b> {equipment_name}\n"
+            f"🚜 <b>Модель:</b> {model}\n"
+            f"🔢 <b>VIN:</b> {vin}\n"
+            f"📊 <b>Моточасы:</b> {data.get('motohours', 0)}\n"
+            f"🛠️ <b>Последнее ТО:</b> {data.get('last_service', 'Не указано')}\n\n"
+            f"Техника добавлена в ваш автопарк. ID: {equipment_id}",
+            reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
+        )
+        
+    else:
+        await reply(
+            message,
+            "❌ Ошибка при сохранении техники в базу.",
+            reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
+        )
+    
+    await state.clear()
+ 
 # ========== АДМИН ФУНКЦИИ ==========
 @dp.message(F.text == "👥 Все пользователи")
 async def all_users(message: types.Message):
@@ -569,7 +1119,7 @@ async def all_users(message: types.Message):
         text += f"<i>... и еще {len(users) - 15} пользователей</i>"
     
     await reply(message, text)
-
+ 
 @dp.message(F.text == "🏢 Все организации")
 async def all_organizations(message: types.Message):
     """Показывает все организации (админ)"""
@@ -594,7 +1144,7 @@ async def all_organizations(message: types.Message):
         text += "\n"
     
     await reply(message, text)
-
+ 
 @dp.message(F.text == "➕ Назначить роль")
 async def assign_role_start(message: types.Message, state: FSMContext):
     """Начинает процесс назначения роли (админ)"""
@@ -610,7 +1160,7 @@ async def assign_role_start(message: types.Message, state: FSMContext):
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_user_id_to_assign)
-
+ 
 @dp.message(UserStates.waiting_for_user_id_to_assign)
 async def process_user_id_for_role(message: types.Message, state: FSMContext):
     """Обрабатывает ID пользователя для назначения роли"""
@@ -652,7 +1202,7 @@ async def process_user_id_for_role(message: types.Message, state: FSMContext):
         
     except ValueError:
         await reply(message, "❌ Введите числовой ID пользователя!")
-
+ 
 @dp.message(UserStates.waiting_for_role_to_assign)
 async def process_role_to_assign(message: types.Message, state: FSMContext):
     """Обрабатывает выбор роли для назначения"""
@@ -677,46 +1227,37 @@ async def process_role_to_assign(message: types.Message, state: FSMContext):
     selected_role = role_map[message.text]
     data = await state.get_data()
     user_id_to_assign = data.get('user_id_to_assign')
+    user_to_assign_name = data.get('user_to_assign_name')
+    
+    if not user_to_assign_name:
+        user_to_assign = await db.get_user(user_id_to_assign)
+        user_to_assign_name = user_to_assign['full_name'] if user_to_assign else f"ID {user_id_to_assign}"
     
     if selected_role == 'director':
-        # Для директора нужно выбрать организацию или создать новую
-        organizations = await db.get_all_organizations_simple()
-        
-        if organizations:
-            keyboard = []
-            for org in organizations[:5]:
-                keyboard.append([types.KeyboardButton(text=f"🏢 {org['name']} (ID: {org['id']})")])
-            keyboard.append([types.KeyboardButton(text="🏢 Создать новую организацию")])
-            keyboard.append([types.KeyboardButton(text="❌ Отмена")])
-            
-            await reply(
-                message,
-                "🏢 <b>Выберите организацию для директора:</b>\n\n"
-                "Или создайте новую организацию:",
-                reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-            )
-            await state.update_data(selected_role=selected_role)
-            await state.set_state(UserStates.waiting_for_org_to_assign)
-        else:
-            # Нет организаций - предлагаем создать новую
-            await reply(
-                message,
-                "🏢 <b>Организаций пока нет</b>\n\n"
-                "Создать новую организацию для директора?",
-                reply_markup=get_yes_no_keyboard()
-            )
-            await state.update_data(selected_role=selected_role, create_new_org=True)
-            await state.set_state(UserStates.waiting_for_org_to_assign)
+        # Для директора сразу создаем организацию
+        await reply(
+            message,
+            f"👨‍💼 <b>Назначение директора</b>\n\n"
+            f"Пользователь: {user_to_assign_name}\n"
+            f"ID: {user_id_to_assign}\n\n"
+            f"Введите название организации для этого директора:",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.update_data(
+            selected_role=selected_role,
+            user_id_to_assign=user_id_to_assign,
+            user_to_assign_name=user_to_assign_name
+        )
+        await state.set_state(UserStates.waiting_for_org_to_assign)
     else:
         # Для других ролей просто назначаем
         success = await db.assign_role_to_user(user_id_to_assign, selected_role)
         
         if success:
-            user_to_assign = await db.get_user(user_id_to_assign)
             await reply(
                 message,
                 f"✅ <b>Роль назначена успешно!</b>\n\n"
-                f"<b>Пользователь:</b> {user_to_assign['full_name']}\n"
+                f"<b>Пользователь:</b> {user_to_assign_name}\n"
                 f"<b>Роль:</b> {message.text}\n"
                 f"<b>ID:</b> {user_id_to_assign}\n\n"
                 f"Пользователь получит уведомление."
@@ -736,7 +1277,58 @@ async def process_role_to_assign(message: types.Message, state: FSMContext):
         await state.clear()
         await reply(message, "Возврат в главное меню", 
                    reply_markup=get_main_keyboard('botadmin', True))
-
+ 
+@dp.message(UserStates.waiting_for_org_to_assign)
+async def process_org_for_director(message: types.Message, state: FSMContext):
+    """Обрабатывает создание организации для директора"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await reply(message, "❌ Назначение отменено", 
+                   reply_markup=get_main_keyboard('botadmin', True))
+        return
+    
+    org_name = message.text.strip()
+    data = await state.get_data()
+    user_id_to_assign = data.get('user_id_to_assign')
+    selected_role = data.get('selected_role')
+    user_to_assign_name = data.get('user_to_assign_name', f"ID {user_id_to_assign}")
+    
+    # Создаем организацию
+    org_id, error = await db.create_organization_for_director(user_id_to_assign, org_name)
+    
+    if error:
+        await reply(message, f"❌ Ошибка: {error}")
+        return
+    
+    # Назначаем роль
+    success = await db.assign_role_to_user(user_id_to_assign, selected_role, org_id)
+    
+    if success:
+        await reply(
+            message,
+            f"✅ <b>Директор назначен успешно!</b>\n\n"
+            f"<b>Пользователь:</b> {user_to_assign_name}\n"
+            f"<b>Роль:</b> 👨‍💼 Директор\n"
+            f"<b>Организация:</b> {org_name}\n"
+            f"<b>ID организации:</b> {org_id}\n\n"
+            f"Пользователь получил доступ к управлению организацией."
+        )
+        
+        # Уведомляем пользователя
+        await send_to_user(
+            user_id_to_assign,
+            f"✅ <b>Вам назначена роль Директора!</b>\n\n"
+            f"<b>Организация:</b> {org_name}\n"
+            f"<b>ID организации:</b> {org_id}\n\n"
+            f"Используйте команду /start для начала работы."
+        )
+    else:
+        await reply(message, "❌ Ошибка при назначении роли!")
+    
+    await state.clear()
+    await reply(message, "Возврат в главное меню", 
+               reply_markup=get_main_keyboard('botadmin', True))
+ 
 @dp.message(F.text == "📊 Статистика")
 async def admin_stats(message: types.Message):
     """Показывает статистику (админ)"""
@@ -779,7 +1371,7 @@ async def admin_stats(message: types.Message):
     text += f"\n<b>Активных смен:</b> {active_shifts}\n"
     
     await reply(message, text)
-
+ 
 # ========== ФУНКЦИИ ДИРЕКТОРА ==========
 @dp.message(F.text == "🏢 Создать организацию")
 async def create_organization_start(message: types.Message, state: FSMContext):
@@ -801,7 +1393,7 @@ async def create_organization_start(message: types.Message, state: FSMContext):
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_ai_question)  # Временно используем это состояние
-
+ 
 @dp.message(F.text == "🏢 Моя организация")
 async def my_organization(message: types.Message):
     """Информация об организации (директор)"""
@@ -851,7 +1443,7 @@ async def my_organization(message: types.Message):
             text += f"<i>... и еще {len(equipment) - 5} единиц техники</i>\n"
     
     await reply(message, text)
-
+ 
 @dp.message(F.text == "🚜 Автопарк")
 async def fleet_list(message: types.Message):
     """Список техники в организации"""
@@ -895,7 +1487,7 @@ async def fleet_list(message: types.Message):
         text += "\n"
     
     await reply(message, text)
-
+ 
 # ========== ФУНКЦИИ ВОДИТЕЛЯ ==========
 @dp.message(F.text == "🚛 Начать смену")
 async def start_shift_begin(message: types.Message, state: FSMContext):
@@ -946,7 +1538,7 @@ async def start_shift_begin(message: types.Message, state: FSMContext):
         reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     )
     await state.set_state(UserStates.waiting_for_equipment_selection)
-
+ 
 @dp.message(UserStates.waiting_for_equipment_selection)
 async def process_equipment_selection(message: types.Message, state: FSMContext):
     """Обрабатывает выбор техники для смены"""
@@ -979,7 +1571,7 @@ async def process_equipment_selection(message: types.Message, state: FSMContext)
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_start_odometer)
-
+ 
 @dp.message(UserStates.waiting_for_start_odometer)
 async def process_start_odometer(message: types.Message, state: FSMContext):
     """Обрабатывает начальный одометр"""
@@ -1027,7 +1619,7 @@ async def process_start_odometer(message: types.Message, state: FSMContext):
     else:
         await reply(message, "❌ Ошибка при начале смены!")
         await state.clear()
-
+ 
 # ========== СИСТЕМА НАПОМИНАНИЙ ==========
 async def check_and_send_notifications():
     """Проверяет и отправляет напоминания"""
@@ -1082,7 +1674,7 @@ async def check_and_send_notifications():
     
     except Exception as e:
         logger.error(f"Ошибка в системе напоминаний: {e}")
-
+ 
 # ========== ПЛАНИРОВЩИК ==========
 async def scheduler():
     """Планировщик задач"""
@@ -1091,7 +1683,7 @@ async def scheduler():
     while True:
         await aioschedule.run_pending()
         await asyncio.sleep(60)
-
+ 
 # ========== ЗАПУСК БОТА ==========
 async def on_startup():
     """Инициализация при запуске"""
@@ -1113,10 +1705,11 @@ async def on_startup():
         logger.info("✅ Бот запущен!")
         logger.info(f"👑 Администратор: ID {ADMIN_ID}")
         logger.info(f"🤖 ИИ помощник: {'ВКЛ' if AI_ENABLED else 'ВЫКЛ'}")
+        logger.info(f"👁️ Vision API: {'ВКЛ' if VISION_API_KEY and VISION_FOLDER_ID else 'ВЫКЛ'}")
         
     except Exception as e:
         logger.error(f"❌ Ошибка запуска: {e}")
-
+ 
 async def main():
     """Основная функция"""
     await on_startup()
@@ -1128,6 +1721,6 @@ async def main():
         logger.error(f"❌ Критическая ошибка: {e}")
     finally:
         await db.close()
-
+ 
 if __name__ == "__main__":
     asyncio.run(main())
