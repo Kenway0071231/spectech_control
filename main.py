@@ -32,12 +32,25 @@ logger = logging.getLogger(__name__)
 # Настройки ИИ
 AI_ENABLED = os.getenv('AI_ENABLED', 'False').lower() == 'true'
 YANDEX_API_KEY = os.getenv('YANDEX_API_KEY', '')
-YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID', '')
+YANDEX_GPT_FOLDER_ID = os.getenv('YC_FOLDER_ID', '')  # Для Yandex GPT
+VISION_FOLDER_ID = os.getenv('VISION_FOLDER_ID', '')  # Для Yandex Vision
 YANDEX_GPT_MODEL = os.getenv('YANDEX_GPT_MODEL', 'yandexgpt-lite')
 
+# Настройки Object Storage (если нужно в будущем)
+YC_BUCKET_NAME = os.getenv('YC_BUCKET_NAME', '')
+YC_ACCESS_KEY_ID = os.getenv('YC_ACCESS_KEY_ID', '')
+YC_SECRET_KEY = os.getenv('YC_SECRET_KEY', '')
+INPUT_FOLDER = os.getenv('INPUT_FOLDER', 'input')
+RESULT_FOLDER = os.getenv('RESULT_FOLDER', 'result')
+
 # Инициализация бота
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN не найден в .env файле!")
+    exit(1)
+
 bot = Bot(
-    token=os.getenv('BOT_TOKEN'),
+    token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
 
@@ -49,7 +62,7 @@ dp = Dispatcher(storage=storage)
 class YandexVisionAnalyzer:
     def __init__(self):
         self.api_key = YANDEX_API_KEY
-        self.folder_id = YANDEX_FOLDER_ID
+        self.folder_id = VISION_FOLDER_ID  # Используем VISION_FOLDER_ID
         
     async def analyze_document(self, image_bytes: bytes) -> Dict[str, Any]:
         """Анализирует документ (СТС/ПТС) с помощью Yandex Vision"""
@@ -87,7 +100,7 @@ class YandexVisionAnalyzer:
                         return self._extract_text_from_result(result)
                     else:
                         error_text = await response.text()
-                        logger.error(f"Ошибка Vision API: {response.status}")
+                        logger.error(f"Ошибка Vision API: {response.status} - {error_text}")
                         return {"error": f"Ошибка API: {response.status}"}
                         
         except Exception as e:
@@ -201,21 +214,22 @@ async def send_to_user(user_id, text, **kwargs):
 async def ask_yandex_gpt(question: str, context: str = "", user_id: int = None) -> str:
     """Взаимодействие с Yandex GPT"""
     try:
-        if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        if not YANDEX_API_KEY or not YANDEX_GPT_FOLDER_ID:
             return "⚠️ Yandex GPT не настроен. Обратитесь к администратору."
         
+        # ИСПРАВЛЕННЫЙ URL (без многоточия)
         url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         
         headers = {
             "Authorization": f"Api-Key {YANDEX_API_KEY}",
-            "x-folder-id": YANDEX_FOLDER_ID,
+            "x-folder-id": YANDEX_GPT_FOLDER_ID,
             "Content-Type": "application/json"
         }
         
         system_prompt = "Ты — профессиональный помощник по обслуживанию и эксплуатации спецтехники."
         
         data = {
-            "modelUri": f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_GPT_MODEL}",
+            "modelUri": f"gpt://{YANDEX_GPT_FOLDER_ID}/{YANDEX_GPT_MODEL}",
             "completionOptions": {
                 "stream": False,
                 "temperature": 0.3,
@@ -335,7 +349,7 @@ async def ask_ai_assistant(question: str, context: str = "", user_id: int = None
             if user and user['role'] not in allowed_roles:
                 return "⛔ Доступ к ИИ-помощнику только для назначенных пользователей."
         
-        if YANDEX_API_KEY and YANDEX_FOLDER_ID:
+        if YANDEX_API_KEY and YANDEX_GPT_FOLDER_ID:
             return await ask_yandex_gpt(question, context, user_id)
         
         return "🤖 Для точного ответа обратитесь к руководству по эксплуатации или к начальнику парка."
@@ -1303,7 +1317,7 @@ async def my_organization(message: types.Message):
 
 @dp.message(F.text == "👥 Сотрудники")
 async def show_employees(message: types.Message):
-    """Показывает сотрудников организации"""
+    """Показывает сотрудники организации"""
     user = await db.get_user(message.from_user.id)
     
     if user['role'] not in ['director', 'fleetmanager'] or not user.get('organization_id'):
