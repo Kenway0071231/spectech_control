@@ -5,10 +5,8 @@ import json
 import base64
 import re
 import aiohttp
-import aiocron
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any, Tuple
-from io import BytesIO
+from datetime import datetime
+from typing import Optional, Dict, List, Any
 from enum import Enum
 
 from aiogram import Bot, Dispatcher, types, F
@@ -16,8 +14,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.default import DefaultBotProperties
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 
 from database import db
@@ -77,11 +74,7 @@ if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не найден в .env файле!")
     exit(1)
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode="HTML")
-)
-
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -98,13 +91,6 @@ class DocumentAnalyzer:
     async def analyze_document(self, image_bytes: bytes, document_type: str = "СТС") -> Dict[str, Any]:
         """
         Анализирует документ СТС/ПТС через Yandex Cloud Function
-        
-        Args:
-            image_bytes: Байты изображения документа
-            document_type: Тип документа (СТС, ПТС, ПСМ)
-            
-        Returns:
-            Dict с результатами анализа
         """
         if not self.enabled:
             return {"error": "Функция анализа документов отключена", "success": False}
@@ -115,11 +101,11 @@ class DocumentAnalyzer:
         # Кодируем изображение в base64
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
         
-        # Формируем промпт с учетом типа документа
+        # Формируем промпт
         prompt = get_prompt("document_analysis")
         prompt = prompt.replace("СТС/ПТС/ПСМ/Другое", document_type)
         
-        # Формируем запрос к функции
+        # Формируем запрос
         payload = {
             "image": image_base64,
             "prompt": prompt,
@@ -144,21 +130,19 @@ class DocumentAnalyzer:
                         
                         if response.status == 200:
                             result_data = await response.json()
-                            logger.info(f"Получен ответ от функции анализа документов (попытка {attempt + 1})")
-                            
-                            # Обрабатываем ответ
+                            logger.info(f"Получен ответ (попытка {attempt + 1})")
                             return self._process_response(result_data, document_type)
                             
                         elif response.status == 429:
-                            logger.warning(f"Слишком много запросов. Попытка {attempt + 1} из {self.max_retries}")
+                            logger.warning(f"Слишком много запросов. Попытка {attempt + 1}")
                             if attempt < self.max_retries - 1:
-                                wait_time = 2 ** attempt  # Экспоненциальная задержка
+                                wait_time = 2 ** attempt
                                 await asyncio.sleep(wait_time)
                                 continue
                             
                         else:
                             error_text = await response.text()
-                            logger.error(f"Ошибка функции анализа: {response.status} - {error_text[:200]}")
+                            logger.error(f"Ошибка функции: {response.status}")
                             return {
                                 "error": f"Ошибка API: {response.status}",
                                 "status_code": response.status,
@@ -166,7 +150,7 @@ class DocumentAnalyzer:
                             }
                             
             except asyncio.TimeoutError:
-                logger.warning(f"Таймаут при анализе документа (попытка {attempt + 1})")
+                logger.warning(f"Таймаут (попытка {attempt + 1})")
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(1)
                     continue
@@ -214,27 +198,22 @@ class DocumentAnalyzer:
                 validated_data["quality_score"] = quality_score["score"]
                 validated_data["missing_fields"] = quality_score["missing_fields"]
                 
-                # Логируем результат
-                logger.info(f"Анализ завершен: {quality_score['quality']} качество, найдено {20 - len(quality_score['missing_fields'])}/20 полей")
+                logger.info(f"Анализ завершен: {quality_score['quality']} качество")
                 
                 return validated_data
             else:
-                # Если не удалось распознать JSON, пробуем классифицировать текст
-                classified_type = self._classify_document_from_text(result_text)
                 return {
                     "success": False,
                     "error": "Не удалось извлечь структурированные данные",
-                    "extracted_text": result_text[:1000],
-                    "classified_type": classified_type,
-                    "suggestion": "Попробуйте сделать более четкое фото или использовать другой документ"
+                    "extracted_text": result_text[:500],
+                    "suggestion": "Попробуйте сделать более четкое фото"
                 }
                 
         except Exception as e:
             logger.error(f"Ошибка обработки ответа: {e}")
             return {
                 "success": False,
-                "error": f"Ошибка обработки: {str(e)}",
-                "raw_response": str(result_data)[:500]
+                "error": f"Ошибка обработки: {str(e)}"
             }
     
     def _extract_json_from_response(self, response_text: str) -> Optional[Dict]:
@@ -242,9 +221,9 @@ class DocumentAnalyzer:
         try:
             # Ищем JSON в ответе
             json_patterns = [
-                r'```json\s*(.*?)\s*```',  # JSON в markdown
-                r'```\s*(.*?)\s*```',      # Любой код в markdown
-                r'(\{.*?\})',               # Просто JSON
+                r'```json\s*(.*?)\s*```',
+                r'```\s*(.*?)\s*```',
+                r'(\{.*?\})',
             ]
             
             json_str = None
@@ -254,7 +233,6 @@ class DocumentAnalyzer:
                     json_str = match.group(1) if len(match.groups()) > 0 else match.group(0)
                     break
             
-            # Если не нашли по паттернам, пробуем весь текст как JSON
             if not json_str:
                 # Ищем начало и конец JSON
                 start = response_text.find('{')
@@ -263,45 +241,21 @@ class DocumentAnalyzer:
                     json_str = response_text[start:end+1]
             
             if json_str:
-                # Очищаем строку от лишних символов
+                # Очищаем строку
                 json_str = json_str.strip()
-                # Заменяем нестандартные кавычки
-                json_str = json_str.replace('"', '"').replace('"', '"')
-                # Удаляем управляющие символы
                 json_str = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_str)
                 
                 data = json.loads(json_str)
                 return data
                 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Ошибка декодирования JSON: {e}")
-            # Пытаемся исправить распространенные ошибки
-            try:
-                json_str = self._fix_json_errors(json_str)
-                if json_str:
-                    data = json.loads(json_str)
-                    return data
-            except:
-                pass
+        except json.JSONDecodeError:
+            logger.warning("Ошибка декодирования JSON")
+            return None
                 
         except Exception as e:
             logger.error(f"Ошибка при извлечении JSON: {e}")
             
         return None
-    
-    def _fix_json_errors(self, json_str: str) -> Optional[str]:
-        """Пытается исправить распространенные ошибки в JSON"""
-        try:
-            # Заменяем одинарные кавычки на двойные
-            json_str = re.sub(r"(?<!\\)'", '"', json_str)
-            # Исправляем незакрытые кавычки
-            json_str = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', json_str)
-            # Исправляем trailing commas
-            json_str = re.sub(r',\s*}', '}', json_str)
-            json_str = re.sub(r',\s*]', ']', json_str)
-            return json_str
-        except:
-            return None
     
     def _validate_and_clean_data(self, data: Dict) -> Dict:
         """Валидирует и очищает данные из JSON"""
@@ -323,16 +277,13 @@ class DocumentAnalyzer:
                 cleaned[field] = None
                 continue
             
-            # Очистка и валидация для каждого поля
+            # Очистка и валидация
             if isinstance(value, str):
                 value = value.strip()
-                
-                # Убираем лишние символы
                 value = re.sub(r'\s+', ' ', value)
                 
-                # Специальная обработка для разных полей
+                # Специальная обработка
                 if field == "vin":
-                    # Ищем VIN в тексте
                     vin_match = re.search(r'[A-HJ-NPR-Z0-9]{17}', value.upper())
                     if vin_match:
                         value = vin_match.group(0)
@@ -340,13 +291,10 @@ class DocumentAnalyzer:
                         value = None
                         
                 elif field == "registration_number":
-                    # Стандартизируем госномер
                     value = value.upper()
-                    # Удаляем лишние пробелы и символы
                     value = re.sub(r'[^А-Я0-9]', '', value)
                     
                 elif field == "year":
-                    # Извлекаем год
                     year_match = re.search(r'\b(19\d{2}|20\d{2})\b', value)
                     if year_match:
                         value = int(year_match.group(0))
@@ -354,12 +302,10 @@ class DocumentAnalyzer:
                         value = None
                         
                 elif field == "engine_power":
-                    # Извлекаем мощность
                     power_match = re.search(r'(\d+)\s*(л\.с\.|лс|кВт|сил|hp)', value, re.IGNORECASE)
                     if power_match:
                         value = int(power_match.group(1))
                     else:
-                        # Пробуем найти просто число
                         num_match = re.search(r'\b(\d{2,4})\b', value)
                         if num_match:
                             value = int(num_match.group(1))
@@ -367,7 +313,6 @@ class DocumentAnalyzer:
                             value = None
                             
                 elif field == "color":
-                    # Стандартизируем цвет
                     colors = ["белый", "черный", "красный", "синий", "зеленый", 
                              "желтый", "серый", "коричневый", "оранжевый", "фиолетовый"]
                     for color in colors:
@@ -376,7 +321,6 @@ class DocumentAnalyzer:
                             break
                 
                 elif field in ["weight", "max_weight", "engine_volume"]:
-                    # Извлекаем числа
                     num_match = re.search(r'\b(\d+)\b', value)
                     if num_match:
                         value = int(num_match.group(0))
@@ -389,37 +333,31 @@ class DocumentAnalyzer:
     
     def _calculate_quality_score(self, data: Dict) -> Dict[str, Any]:
         """Рассчитывает качество распознавания"""
-        # Критически важные поля
         critical_fields = ["vin", "model", "brand"]
-        
-        # Важные поля
         important_fields = ["registration_number", "year", "engine_power", "category"]
-        
-        # Дополнительные поля
         additional_fields = ["color", "weight", "owner", "registration_date"]
         
         missing_fields = []
         score = 0
-        max_score = 100
         
-        # Проверяем критические поля (40% от оценки)
+        # Проверяем критические поля
         for field in critical_fields:
             if data.get(field):
-                score += 13.33  # 40/3
+                score += 13.33
             else:
                 missing_fields.append(field)
         
-        # Проверяем важные поля (35% от оценки)
+        # Проверяем важные поля
         for field in important_fields:
             if data.get(field):
-                score += 8.75  # 35/4
+                score += 8.75
             else:
                 missing_fields.append(field)
         
-        # Проверяем дополнительные поля (25% от оценки)
+        # Проверяем дополнительные поля
         for field in additional_fields:
             if data.get(field):
-                score += 6.25  # 25/4
+                score += 6.25
         
         # Определяем качество
         if score >= 80:
@@ -434,21 +372,6 @@ class DocumentAnalyzer:
             "score": round(score, 2),
             "missing_fields": missing_fields
         }
-    
-    def _classify_document_from_text(self, text: str) -> str:
-        """Классифицирует документ по тексту"""
-        text_lower = text.lower()
-        
-        if "свидетельство о регистрации" in text_lower and "гибдд" in text_lower:
-            return "СТС"
-        elif "паспорт транспортного средства" in text_lower:
-            return "ПТС"
-        elif "паспорт самоходной машины" in text_lower:
-            return "ПСМ"
-        elif "свидетельство о регистрации самоходной машины" in text_lower:
-            return "СТСМ"
-        else:
-            return "НЕИЗВЕСТНО"
 
 # ========== КЛАСС ДЛЯ YANDEX VISION ==========
 class YandexVisionAnalyzer:
@@ -479,8 +402,7 @@ class YandexVisionAnalyzer:
                     "features": [{
                         "type": "TEXT_DETECTION",
                         "textDetectionConfig": {
-                            "languageCodes": ["ru", "en"],
-                            "model": "page"  # Лучшее качество для документов
+                            "languageCodes": ["ru", "en"]
                         }
                     }]
                 }]
@@ -493,7 +415,7 @@ class YandexVisionAnalyzer:
                         return self._extract_text_from_vision_result(result)
                     else:
                         error_text = await response.text()
-                        logger.error(f"Ошибка Vision API: {response.status} - {error_text[:200]}")
+                        logger.error(f"Ошибка Vision API: {response.status}")
                         return {
                             "error": f"Ошибка API: {response.status}",
                             "success": False
@@ -538,18 +460,13 @@ class YandexVisionAnalyzer:
             if not extracted_text.strip():
                 return {
                     "success": False,
-                    "error": "Не удалось извлечь текст из документа",
-                    "raw_result": result
+                    "error": "Не удалось извлечь текст из документа"
                 }
-            
-            # Анализируем структуру текста
-            structure = self._analyze_text_structure(extracted_text)
             
             return {
                 "success": True,
                 "extracted_text": extracted_text.strip(),
                 "text_blocks": blocks_info,
-                "structure": structure,
                 "total_blocks": len(blocks_info),
                 "average_confidence": sum(b["confidence"] for b in blocks_info) / len(blocks_info) if blocks_info else 0
             }
@@ -558,34 +475,8 @@ class YandexVisionAnalyzer:
             logger.error(f"Ошибка извлечения текста: {e}")
             return {
                 "success": False,
-                "error": f"Ошибка обработки: {e}",
-                "raw_result": result
+                "error": f"Ошибка обработки: {e}"
             }
-    
-    def _analyze_text_structure(self, text: str) -> Dict[str, Any]:
-        """Анализирует структуру текста документа"""
-        lines = text.split('\n')
-        
-        # Ищем ключевые разделы
-        sections = {
-            "personal_data": any(word in text.lower() for word in ["фио", "собственник", "владелец"]),
-            "vehicle_data": any(word in text.lower() for word in ["марка", "модель", "vin", "год"]),
-            "registration_data": any(word in text.lower() for word in ["регистрация", "выдан", "дата"]),
-            "technical_data": any(word in text.lower() for word in ["мощность", "объем", "масса", "цвет"])
-        }
-        
-        # Подсчитываем статистику
-        word_count = len(text.split())
-        line_count = len(lines)
-        avg_line_length = sum(len(line) for line in lines) / line_count if line_count > 0 else 0
-        
-        return {
-            "sections_found": sum(sections.values()),
-            "sections": sections,
-            "word_count": word_count,
-            "line_count": line_count,
-            "avg_line_length": round(avg_line_length, 2)
-        }
 
 # ========== КЛАСС ДЛЯ ИИ РЕГИСТРАЦИИ ==========
 class RegistrationAI:
@@ -599,13 +490,6 @@ class RegistrationAI:
     async def register_equipment_from_document(self, image_bytes: bytes, document_type: str = "СТС") -> Dict[str, Any]:
         """
         Регистрирует технику на основе анализа документа
-        
-        Args:
-            image_bytes: Байты изображения документа
-            document_type: Тип документа
-            
-        Returns:
-            Dict с данными для регистрации
         """
         try:
             logger.info(f"Начало регистрации техники из документа типа {document_type}")
@@ -622,8 +506,7 @@ class RegistrationAI:
             quality = document_analysis.get("analysis_quality", "low")
             
             if quality == "low":
-                logger.warning("Низкое качество распознавания, требуются дополнительные проверки")
-                # Пробуем улучшить данные через Vision
+                logger.warning("Низкое качество распознавания")
                 vision_result = await self.vision_analyzer.analyze_document_text(image_bytes)
                 if vision_result.get("success"):
                     document_analysis = self._enhance_with_vision(document_analysis, vision_result)
@@ -641,7 +524,7 @@ class RegistrationAI:
             registration_data["success"] = True
             registration_data["registration_method"] = "cloud_function"
             
-            logger.info(f"Регистрация успешно обработана: {registration_data.get('vin', 'без VIN')}")
+            logger.info(f"Регистрация успешно обработана")
             
             return registration_data
             
@@ -656,14 +539,14 @@ class RegistrationAI:
     async def _fallback_registration(self, image_bytes: bytes, document_type: str) -> Dict[str, Any]:
         """Запасной метод регистрации через Vision API"""
         try:
-            logger.info("Используем запасной метод регистрации через Vision API")
+            logger.info("Используем запасной метод через Vision API")
             
             # 1. Получаем текст через Vision API
             vision_result = await self.vision_analyzer.analyze_document_text(image_bytes)
             
             if not vision_result.get("success"):
                 return {
-                    "error": vision_result.get("error", "Неизвестная ошибка Vision API"),
+                    "error": vision_result.get("error", "Неизвестная ошибка"),
                     "success": False,
                     "registration_method": "vision_failed"
                 }
@@ -682,11 +565,6 @@ class RegistrationAI:
             # 4. Форматируем данные
             registration_data = self._format_registration_data(manual_data)
             registration_data["extracted_text"] = extracted_text[:1000] + "..." if len(extracted_text) > 1000 else extracted_text
-            registration_data["vision_result"] = {
-                "total_blocks": vision_result.get("total_blocks", 0),
-                "average_confidence": vision_result.get("average_confidence", 0),
-                "structure": vision_result.get("structure", {})
-            }
             registration_data["success"] = True
             registration_data["registration_method"] = "vision_api"
             registration_data["requires_manual_check"] = True
@@ -694,7 +572,7 @@ class RegistrationAI:
             return registration_data
             
         except Exception as e:
-            logger.error(f"Ошибка запасного метода регистрации: {e}")
+            logger.error(f"Ошибка запасного метода: {e}")
             return {
                 "error": str(e),
                 "success": False,
@@ -715,7 +593,6 @@ class RegistrationAI:
             
             # Если госномер не найден
             if not enhanced.get("registration_number") or enhanced.get("registration_number") == "null":
-                # Паттерны для российских номеров
                 patterns = [
                     r'[АВЕКМНОРСТУХ]{1}\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}',
                     r'[АВЕКМНОРСТУХ]{2}\d{3}\d{2,3}',
@@ -727,9 +604,6 @@ class RegistrationAI:
                     if match:
                         enhanced["registration_number"] = match.group(0)
                         break
-            
-            # Обновляем извлеченный текст
-            enhanced["extracted_text"] = extracted_text[:2000] + "..." if len(extracted_text) > 2000 else extracted_text
             
             return enhanced
             
@@ -802,9 +676,7 @@ class RegistrationAI:
             "LIEBHERR": ["LIEBHERR"],
             "JCB": ["JCB"],
             "HYUNDAI": ["HYUNDAI"],
-            "DOOSAN": ["DOOSAN"],
-            "XCMG": ["XCMG"],
-            "ZOOMLION": ["ZOOMLION"]
+            "DOOSAN": ["DOOSAN"]
         }
         
         for brand, keywords in common_brands.items():
@@ -916,8 +788,7 @@ class RegistrationAI:
             if not missing_fields and document_data.get("analysis_quality") == "high":
                 return {
                     "status": "excellent",
-                    "message": "Все поля заполнены корректно. Техника готова к регистрации.",
-                    "next_steps": ["Подтвердите регистрацию в системе"]
+                    "message": "Все поля заполнены корректно. Техника готова к регистрации."
                 }
             
             url = self.config['url']
@@ -940,7 +811,7 @@ class RegistrationAI:
                 "messages": [
                     {
                         "role": "system",
-                        "text": "Ты - помощник по регистрации спецтехники. Дай практические рекомендации в формате JSON."
+                        "text": "Ты - помощник по регистрации спецтехники. Дай практические рекомендации."
                     },
                     {
                         "role": "user",
@@ -967,22 +838,19 @@ class RegistrationAI:
                         # Если не JSON, возвращаем как текст
                         return {
                             "status": "recommendations",
-                            "message": answer[:500],
-                            "next_steps": ["Проверьте данные вручную", "Заполните недостающие поля"]
+                            "message": answer[:500]
                         }
                     
             return {
                 "status": "unknown",
-                "message": "Не удалось получить рекомендации",
-                "next_steps": ["Проверьте данные вручную"]
+                "message": "Не удалось получить рекомендации"
             }
             
         except Exception as e:
             logger.error(f"Ошибка получения рекомендаций: {e}")
             return {
                 "status": "error",
-                "message": f"Ошибка: {str(e)}",
-                "next_steps": ["Проверьте данные вручную"]
+                "message": f"Ошибка: {str(e)}"
             }
     
     def _format_registration_data(self, analysis_data: Dict) -> Dict[str, Any]:
@@ -1007,21 +875,6 @@ class RegistrationAI:
         if not vin or vin == "null":
             vin = f"TEMP_{datetime.now().strftime('%Y%m%d%H%M%S')}_{analysis_data.get('document_type', 'DOC')}"
         
-        # Определяем категорию
-        category = analysis_data.get('category', 'Спецтехника')
-        model_lower = str(analysis_data.get('model', '')).lower()
-        
-        if any(word in model_lower for word in ['экскаватор', 'excavator']):
-            category = 'Экскаватор'
-        elif any(word in model_lower for word in ['погрузчик', 'loader']):
-            category = 'Погрузчик'
-        elif any(word in model_lower for word in ['бульдозер', 'bulldozer']):
-            category = 'Бульдозер'
-        elif any(word in model_lower for word in ['кран', 'crane']):
-            category = 'Кран'
-        elif any(word in model_lower for word in ['самосвал', 'dumper']):
-            category = 'Самосвал'
-        
         return {
             "name": name.strip(),
             "model": analysis_data.get('model', 'Неизвестно'),
@@ -1029,16 +882,12 @@ class RegistrationAI:
             "vin": vin,
             "registration_number": analysis_data.get('registration_number', 'Без номера'),
             "year": analysis_data.get('year'),
-            "category": category,
+            "category": analysis_data.get('category', 'Спецтехника'),
             "engine_power": analysis_data.get('engine_power'),
             "color": analysis_data.get('color', 'Неизвестно'),
-            "weight": analysis_data.get('weight'),
-            "max_weight": analysis_data.get('max_weight'),
-            "notes": f"Зарегистрировано через анализ {analysis_data.get('document_type', 'документа')}. "
-                    f"Качество анализа: {analysis_data.get('analysis_quality', 'неизвестно')}",
+            "notes": f"Зарегистрировано через анализ {analysis_data.get('document_type', 'документа')}",
             "document_type": analysis_data.get('document_type', 'Неизвестно'),
-            "analysis_quality": analysis_data.get('analysis_quality', 'unknown'),
-            "missing_fields": analysis_data.get('missing_fields', [])
+            "analysis_quality": analysis_data.get('analysis_quality', 'unknown')
         }
 
 # ========== СОЗДАЕМ ЭКЗЕМПЛЯРЫ ==========
@@ -1048,7 +897,6 @@ registration_ai = RegistrationAI()
 
 # ========== СОСТОЯНИЯ ==========
 class UserStates(StatesGroup):
-    # Основные состояния
     waiting_for_document_type = State()
     waiting_for_document_photo = State()
     waiting_for_document_analysis = State()
@@ -1056,11 +904,7 @@ class UserStates(StatesGroup):
     waiting_for_equipment_name = State()
     waiting_for_motohours = State()
     waiting_for_last_service = State()
-    
-    # Дополнительные
-    waiting_for_additional_info = State()
     waiting_for_manual_correction = State()
-    waiting_for_field_correction = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 async def send_typing(chat_id):
@@ -1076,155 +920,100 @@ async def reply(message, text, **kwargs):
     await send_typing(message.chat.id)
     return await message.answer(text, **kwargs)
 
-async def send_to_user(user_id, text, **kwargs):
-    """Отправляет сообщение пользователю по ID"""
-    try:
-        await bot.send_message(user_id, text, **kwargs)
-    except Exception as e:
-        logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-
 def get_main_keyboard(role, has_organization=False):
     """Генерирует клавиатуру в зависимости от роли"""
     
     if role == 'unassigned':
-        return types.ReplyKeyboardMarkup(
+        return ReplyKeyboardMarkup(
             keyboard=[
-                [types.KeyboardButton(text="ℹ️ Информация о боте")],
-                [types.KeyboardButton(text="📞 Контакты")],
+                [KeyboardButton(text="ℹ️ Информация о боте")],
+                [KeyboardButton(text="📞 Контакты")],
             ],
             resize_keyboard=True
         )
     
     if role == 'botadmin':
-        return types.ReplyKeyboardMarkup(
+        return ReplyKeyboardMarkup(
             keyboard=[
-                [types.KeyboardButton(text="👥 Все пользователи")],
-                [types.KeyboardButton(text="🏢 Все организации")],
-                [types.KeyboardButton(text="➕ Назначить роль")],
-                [types.KeyboardButton(text="📊 Статистика")],
-                [types.KeyboardButton(text="⚙️ Настройки ИИ")],
+                [KeyboardButton(text="👥 Все пользователи")],
+                [KeyboardButton(text="🏢 Все организации")],
+                [KeyboardButton(text="📊 Статистика")],
+                [KeyboardButton(text="⚙️ Настройки ИИ")],
             ],
             resize_keyboard=True
         )
     
     if role == 'director':
         if not has_organization:
-            return types.ReplyKeyboardMarkup(
+            return ReplyKeyboardMarkup(
                 keyboard=[
-                    [types.KeyboardButton(text="🏢 Создать организацию")],
-                    [types.KeyboardButton(text="ℹ️ Информация о боте")],
-                    [types.KeyboardButton(text="📞 Контакты")],
+                    [KeyboardButton(text="🏢 Создать организацию")],
+                    [KeyboardButton(text="ℹ️ Информация о боте")],
                 ],
                 resize_keyboard=True
             )
         else:
-            return types.ReplyKeyboardMarkup(
+            return ReplyKeyboardMarkup(
                 keyboard=[
-                    [types.KeyboardButton(text="🏢 Моя организация")],
-                    [types.KeyboardButton(text="🚜 Автопарк")],
-                    [types.KeyboardButton(text="👥 Сотрудники")],
-                    [types.KeyboardButton(text="📷 Зарегистрировать технику")],
-                    [types.KeyboardButton(text="📊 Статистика")],
-                    [types.KeyboardButton(text="🔧 Сервисный помощник")],
+                    [KeyboardButton(text="🚜 Автопарк")],
+                    [KeyboardButton(text="👥 Сотрудники")],
+                    [KeyboardButton(text="📷 Зарегистрировать технику")],
+                    [KeyboardButton(text="📊 Статистика")],
                 ],
                 resize_keyboard=True
             )
     
     if role == 'fleetmanager':
         if not has_organization:
-            return types.ReplyKeyboardMarkup(
+            return ReplyKeyboardMarkup(
                 keyboard=[
-                    [types.KeyboardButton(text="ℹ️ Информация о боте")],
-                    [types.KeyboardButton(text="📞 Контакты")],
+                    [KeyboardButton(text="ℹ️ Информация о боте")],
                 ],
                 resize_keyboard=True
             )
         else:
-            return types.ReplyKeyboardMarkup(
+            return ReplyKeyboardMarkup(
                 keyboard=[
-                    [types.KeyboardButton(text="🚜 Управление парком")],
-                    [types.KeyboardButton(text="🔍 Проверить осмотры")],
-                    [types.KeyboardButton(text="📅 Ближайшие ТО")],
-                    [types.KeyboardButton(text="📷 Зарегистрировать технику")],
-                    [types.KeyboardButton(text="🔧 Сервисный помощник")],
-                    [types.KeyboardButton(text="📦 Заказы запчастей")],
+                    [KeyboardButton(text="🚜 Управление парком")],
+                    [KeyboardButton(text="📷 Зарегистрировать технику")],
+                    [KeyboardButton(text="📊 Статистика")],
                 ],
                 resize_keyboard=True
             )
     
-    if role == 'driver':
-        if not has_organization:
-            return types.ReplyKeyboardMarkup(
-                keyboard=[
-                    [types.KeyboardButton(text="ℹ️ Информация о боте")],
-                    [types.KeyboardButton(text="📞 Контакты")],
-                ],
-                resize_keyboard=True
-            )
-        else:
-            return types.ReplyKeyboardMarkup(
-                keyboard=[
-                    [types.KeyboardButton(text="🚛 Начать смену")],
-                    [types.KeyboardButton(text="📋 Ежедневный отчет")],
-                    [types.KeyboardButton(text="🚜 Моя техника")],
-                    [types.KeyboardButton(text="🔧 Сервисный помощник")],
-                    [types.KeyboardButton(text="📊 Моя статистика")],
-                ],
-                resize_keyboard=True
-            )
-    
-    # По умолчанию
-    return types.ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="ℹ️ Информация о боте")],
-            [types.KeyboardButton(text="📞 Контакты")],
+            [KeyboardButton(text="ℹ️ Информация о боте")],
         ],
         resize_keyboard=True
     )
 
 def get_cancel_keyboard():
     """Клавиатура с кнопкой отмена"""
-    return types.ReplyKeyboardMarkup(
-        keyboard=[[types.KeyboardButton(text="❌ Отмена")]],
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True
     )
 
 def get_document_type_keyboard():
     """Клавиатура для выбора типа документа"""
-    return types.ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="📄 СТС (Свидетельство о регистрации)")],
-            [types.KeyboardButton(text="📋 ПТС (Паспорт транспортного средства)")],
-            [types.KeyboardButton(text="🏭 ПСМ (Паспорт самоходной машины)")],
-            [types.KeyboardButton(text="📃 Другой документ")],
-            [types.KeyboardButton(text="❌ Отмена")]
+            [KeyboardButton(text="📄 СТС")],
+            [KeyboardButton(text="📋 ПТС")],
+            [KeyboardButton(text="🏭 ПСМ")],
+            [KeyboardButton(text="❌ Отмена")]
         ],
         resize_keyboard=True
     )
 
 def get_confirmation_keyboard():
     """Клавиатура для подтверждения данных"""
-    return types.ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="✅ Все верно, продолжить")],
-            [types.KeyboardButton(text="✏️ Внести правки")],
-            [types.KeyboardButton(text="🔄 Загрузить другой документ")],
-            [types.KeyboardButton(text="❌ Отмена")]
-        ],
-        resize_keyboard=True
-    )
-
-def get_correction_keyboard():
-    """Клавиатура для корректировки данных"""
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="✅ Подтвердить все данные")],
-            [types.KeyboardButton(text="🔧 Исправить VIN")],
-            [types.KeyboardButton(text="🚗 Исправить госномер")],
-            [types.KeyboardButton(text="🏷️ Исправить модель/марку")],
-            [types.KeyboardButton(text="📅 Исправить год")],
-            [types.KeyboardButton(text="🔄 Загрузить новый документ")],
-            [types.KeyboardButton(text="❌ Отмена")]
+            [KeyboardButton(text="✅ Все верно")],
+            [KeyboardButton(text="✏️ Исправить")],
+            [KeyboardButton(text="❌ Отмена")]
         ],
         resize_keyboard=True
     )
@@ -1232,7 +1021,7 @@ def get_correction_keyboard():
 # ========== КОМАНДА СТАРТ ==========
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    """Главное меню для всех"""
+    """Главное меню"""
     await state.clear()
     
     user = await db.get_user(message.from_user.id)
@@ -1245,13 +1034,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
         user = await db.get_user(message.from_user.id)
 
     if not user:
-        await reply(message, "❌ Ошибка регистрации. Попробуйте еще раз.")
+        await reply(message, "❌ Ошибка регистрации")
         return
     
     role = user['role']
     has_organization = bool(user.get('organization_id'))
     
-    # Для не назначенных пользователей
     if role == 'unassigned':
         welcome_text = (
             f"👋 <b>Добро пожаловать в ТехКонтроль!</b>\n\n"
@@ -1260,17 +1048,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "📋 <b>Для получения доступа:</b>\n"
             "1. Отправьте ваш ID вышестоящему сотруднику\n"
             "2. Администратор назначит вам роль\n"
-            "3. После назначения вы получите доступ к функциям\n\n"
-            "📞 Для ускорения процесса обратитесь к администратору."
+            "3. После назначения вы получите доступ к функциям"
         )
         
         await reply(message, welcome_text, reply_markup=get_main_keyboard(role, has_organization))
         return
     
-    # Для назначенных ролей
     role_names = {
-        'botadmin': '👑 Администратор бота',
-        'director': '👨‍💼 Директор компании',
+        'botadmin': '👑 Администратор',
+        'director': '👨‍💼 Директор',
         'fleetmanager': '👷 Начальник парка',
         'driver': '🚛 Водитель'
     }
@@ -1278,27 +1064,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
     welcome_text = f"🤖 <b>ТехКонтроль</b>\n\n"
     welcome_text += f"<b>Роль:</b> {role_names.get(role, 'Пользователь')}\n"
     welcome_text += f"<b>ID:</b> <code>{message.from_user.id}</code>\n"
-    welcome_text += f"<b>Имя:</b> {message.from_user.full_name}\n"
     
     if has_organization:
         org = await db.get_organization(user['organization_id'])
         if org:
             welcome_text += f"<b>Организация:</b> {org['name']}\n"
     
-    # Особые случаи
-    if role == 'director' and not has_organization:
-        welcome_text += "\n\n📌 <b>Для начала работы создайте организацию</b>"
-    
-    elif role in ['fleetmanager', 'driver'] and not has_organization:
-        welcome_text += "\n\n⏳ <b>Ожидайте назначения в организацию</b>\n"
-        welcome_text += "Для ускорения отправьте ваш ID директору"
-    
     await reply(message, welcome_text, reply_markup=get_main_keyboard(role, has_organization))
 
-# ========== РЕГИСТРАЦИЯ ТЕХНИКИ С АНАЛИЗОМ ДОКУМЕНТОВ ==========
+# ========== РЕГИСТРАЦИЯ ТЕХНИКИ ==========
 @dp.message(F.text == "📷 Зарегистрировать технику")
 async def start_equipment_registration(message: types.Message, state: FSMContext):
-    """Начинает регистрацию техники с анализом документов"""
+    """Начинает регистрацию техники"""
     user = await db.get_user(message.from_user.id)
     
     if user['role'] not in ['director', 'fleetmanager']:
@@ -1315,9 +1092,9 @@ async def start_equipment_registration(message: types.Message, state: FSMContext
     
     await reply(
         message,
-        "🚜 <b>Регистрация новой техники с анализом документов</b>\n\n"
+        "🚜 <b>Регистрация новой техники</b>\n\n"
         "📄 <b>Система автоматически извлечет данные из документов:</b>\n"
-        "• VIN номер\n• Модель и марка\n• Госномер\n• Год выпуска\n• Мощность двигателя\n• Цвет и другие данные\n\n"
+        "• VIN номер\n• Модель и марка\n• Госномер\n• Год выпуска\n\n"
         "📸 <b>Выберите тип документа:</b>",
         reply_markup=get_document_type_keyboard()
     )
@@ -1334,10 +1111,9 @@ async def select_document_type(message: types.Message, state: FSMContext):
         return
     
     document_type_map = {
-        "📄 СТС (Свидетельство о регистрации)": "СТС",
-        "📋 ПТС (Паспорт транспортного средства)": "ПТС",
-        "🏭 ПСМ (Паспорт самоходной машины)": "ПСМ",
-        "📃 Другой документ": "Другой документ"
+        "📄 СТС": "СТС",
+        "📋 ПТС": "ПТС",
+        "🏭 ПСМ": "ПСМ"
     }
     
     if message.text not in document_type_map:
@@ -1345,18 +1121,15 @@ async def select_document_type(message: types.Message, state: FSMContext):
         return
     
     document_type = document_type_map[message.text]
-    
     await state.update_data(document_type=document_type)
     
     await reply(
         message,
         f"📸 <b>Загрузите фото документа ({document_type})</b>\n\n"
-        "<i>Советы для лучшего распознавания:</i>\n"
-        "1. Расположите документ ровно в кадре\n"
+        "<i>Советы:</i>\n"
+        "1. Расположите документ ровно\n"
         "2. Убедитесь в хорошем освещении\n"
-        "3. Весь документ должен быть виден\n"
-        "4. Избегайте бликов и теней\n"
-        "5. Текст должен быть четким\n\n"
+        "3. Весь документ должен быть виден\n\n"
         "<b>Отправьте фото документа:</b>",
         reply_markup=get_cancel_keyboard()
     )
@@ -1366,7 +1139,7 @@ async def select_document_type(message: types.Message, state: FSMContext):
 async def process_document_photo(message: types.Message, state: FSMContext):
     """Обрабатывает фото документа"""
     try:
-        await reply(message, "🔍 <b>Анализирую документ...</b>\n\nИИ обрабатывает изображение...")
+        await reply(message, "🔍 <b>Анализирую документ...</b>")
         
         # Скачиваем фото
         photo = message.photo[-1]
@@ -1378,73 +1151,29 @@ async def process_document_photo(message: types.Message, state: FSMContext):
         data = await state.get_data()
         document_type = data.get('document_type', 'СТС')
         
-        # Сохраняем ID фото
-        await state.update_data(document_photo_id=photo.file_id, image_size=len(image_data))
-        
         # Анализируем документ
         registration_result = await registration_ai.register_equipment_from_document(image_data, document_type)
         
         if not registration_result.get("success", False):
             error_msg = registration_result.get("error", "Неизвестная ошибка")
-            registration_method = registration_result.get("registration_method", "")
-            
-            error_text = f"❌ <b>Ошибка анализа документа:</b> {error_msg}\n\n"
-            
-            if registration_method == "cloud_function":
-                error_text += (
-                    "📡 <b>Проблема с Cloud Function</b>\n"
-                    "1. Проверьте доступность функции\n"
-                    "2. Убедитесь в правильности URL\n"
-                    "3. Попробуйте позже или используйте другой документ\n\n"
-                    "🔄 <b>Попробовать через Vision API:</b>"
-                )
-                
-                # Предлагаем использовать Vision API
-                keyboard = types.ReplyKeyboardMarkup(
-                    keyboard=[
-                        [types.KeyboardButton(text="🔄 Использовать Vision API")],
-                        [types.KeyboardButton(text="📤 Загрузить другой документ")],
-                        [types.KeyboardButton(text="❌ Отмена")]
-                    ],
-                    resize_keyboard=True
-                )
-                
-                await reply(message, error_text, reply_markup=keyboard)
-                await state.update_data(cloud_function_failed=True)
-                return
-            
-            elif registration_method == "vision_failed":
-                error_text += (
-                    "👁️ <b>Не удалось распознать текст</b>\n"
-                    "Попробуйте:\n"
-                    "1. Сделать более четкое фото\n"
-                    "2. Улучшить освещение\n"
-                    "3. Отправить другой документ\n\n"
-                    "Или введите данные вручную."
-                )
-            else:
-                error_text += "Попробуйте другой документ или введите данные вручную."
-            
-            await reply(message, error_text, reply_markup=get_cancel_keyboard())
+            await reply(
+                message,
+                f"❌ <b>Ошибка анализа:</b> {error_msg}\n\n"
+                "Попробуйте:\n"
+                "1. Сделать более четкое фото\n"
+                "2. Улучшить освещение\n"
+                "3. Отправить другой документ",
+                reply_markup=get_cancel_keyboard()
+            )
             return
         
-        # Сохраняем результат анализа
-        await state.update_data(
-            registration_result=registration_result,
-            document_analysis=registration_result.get("document_analysis", {})
-        )
+        # Сохраняем результат
+        await state.update_data(registration_result=registration_result)
         
         # Формируем сообщение с результатами
         result_data = registration_result
         
-        info_text = "✅ <b>Документ успешно проанализирован!</b>\n\n"
-        
-        # Статус анализа
-        quality = result_data.get("analysis_quality", "unknown")
-        quality_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(quality, "⚪")
-        
-        info_text += f"<b>Качество анализа:</b> {quality_emoji} {quality.upper()}\n"
-        info_text += f"<b>Метод:</b> {result_data.get('registration_method', 'неизвестно')}\n\n"
+        info_text = "✅ <b>Документ проанализирован!</b>\n\n"
         
         # Основные поля
         fields = [
@@ -1456,50 +1185,33 @@ async def process_document_photo(message: types.Message, state: FSMContext):
             ("📅 Год выпуска", result_data.get("year")),
             ("⚡ Мощность", f"{result_data.get('engine_power')} л.с." if result_data.get('engine_power') else None),
             ("🎨 Цвет", result_data.get("color")),
-            ("🏗️ Тип техники", result_data.get("category")),
         ]
         
         for label, value in fields:
             if value:
                 info_text += f"<b>{label}:</b> {value}\n"
         
-        # Отсутствующие поля
-        missing_fields = result_data.get("missing_fields", [])
-        if missing_fields:
-            info_text += f"\n⚠️ <b>Отсутствуют:</b> {', '.join(missing_fields)}\n"
+        # Качество анализа
+        quality = result_data.get("analysis_quality", "unknown")
+        quality_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(quality, "⚪")
+        info_text += f"\n<b>Качество анализа:</b> {quality_emoji} {quality.upper()}\n"
         
-        # Рекомендации ИИ
-        if result_data.get("ai_recommendations"):
-            rec = result_data["ai_recommendations"]
-            if isinstance(rec, dict):
-                status = rec.get("status", "")
-                message = rec.get("message", "")
-                if message:
-                    info_text += f"\n<b>Рекомендации ИИ ({status}):</b>\n{message[:200]}"
-            else:
-                info_text += f"\n<b>Рекомендации ИИ:</b>\n{str(rec)[:200]}"
+        info_text += "\n<b>Все данные верны?</b>"
         
-        info_text += "\n\n<b>Все данные верны?</b>"
-        
-        if quality == "low":
-            await reply(message, info_text, reply_markup=get_correction_keyboard())
-        else:
-            await reply(message, info_text, reply_markup=get_confirmation_keyboard())
-        
+        await reply(message, info_text, reply_markup=get_confirmation_keyboard())
         await state.set_state(UserStates.waiting_for_document_analysis)
         
     except Exception as e:
-        logger.error(f"Ошибка обработки фото документа: {e}")
+        logger.error(f"Ошибка обработки фото: {e}")
         await reply(
             message,
-            "❌ Ошибка при обработке фото. Попробуйте еще раз.\n\n"
-            "<i>Убедитесь, что фото четкое и документ полностью виден.</i>",
+            "❌ Ошибка при обработке фото. Попробуйте еще раз.",
             reply_markup=get_cancel_keyboard()
         )
 
 @dp.message(UserStates.waiting_for_document_analysis)
 async def process_document_analysis_confirmation(message: types.Message, state: FSMContext):
-    """Обрабатывает подтверждение данных документа"""
+    """Обрабатывает подтверждение данных"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
@@ -1507,172 +1219,34 @@ async def process_document_analysis_confirmation(message: types.Message, state: 
                    reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
         return
     
-    if message.text == "🔄 Загрузить другой документ":
+    if message.text == "✏️ Исправить":
         await reply(
             message,
-            "📸 <b>Отправьте новое фото документа</b>\n\n"
-            "Убедитесь, что:\n"
-            "1. Фото четкое\n"
-            "2. Весь документ в кадре\n"
-            "3. Хорошее освещение\n"
-            "4. Нет бликов и теней",
+            "✏️ <b>Введите исправления:</b>\n\n"
+            "<i>Формат:</i>\n"
+            "VIN: X9F12345678901234\n"
+            "Модель: Камаз-6520\n"
+            "Год: 2022\n\n"
+            "<b>Введите исправления:</b>",
             reply_markup=get_cancel_keyboard()
         )
-        await state.set_state(UserStates.waiting_for_document_photo)
+        await state.set_state(UserStates.waiting_for_manual_correction)
         return
     
-    if message.text == "✏️ Внести правки" or message.text.startswith("🔧 Исправить"):
+    if message.text == "✅ Все верно":
         data = await state.get_data()
         registration_result = data.get('registration_result', {})
         
-        if message.text == "✏️ Внести правки":
-            await reply(
-                message,
-                "✏️ <b>Введите исправления в формате:</b>\n\n"
-                "<code>Поле: Значение</code>\n\n"
-                "<i>Пример:</i>\n"
-                "VIN: X9F12345678901234\n"
-                "Модель: Экскаватор Hitachi ZX200\n"
-                "Год: 2022\n"
-                "Цвет: Желтый\n\n"
-                "<b>Введите исправления:</b>",
-                reply_markup=get_cancel_keyboard()
-            )
-            await state.set_state(UserStates.waiting_for_manual_correction)
-            
-        elif message.text == "🔧 Исправить VIN":
-            await reply(
-                message,
-                f"🔧 <b>Текущий VIN:</b> {registration_result.get('vin', 'не указан')}\n\n"
-                "Введите правильный VIN (17 символов):",
-                reply_markup=get_cancel_keyboard()
-            )
-            await state.set_state(UserStates.waiting_for_field_correction)
-            await state.update_data(correcting_field="vin")
-            
-        elif message.text == "🚗 Исправить госномер":
-            await reply(
-                message,
-                f"🚗 <b>Текущий госномер:</b> {registration_result.get('registration_number', 'не указан')}\n\n"
-                "Введите правильный госномер:",
-                reply_markup=get_cancel_keyboard()
-            )
-            await state.set_state(UserStates.waiting_for_field_correction)
-            await state.update_data(correcting_field="registration_number")
-            
-        elif message.text == "🏷️ Исправить модель/марку":
-            await reply(
-                message,
-                f"🏷️ <b>Текущие данные:</b>\n"
-                f"Марка: {registration_result.get('brand', 'не указана')}\n"
-                f"Модель: {registration_result.get('model', 'не указана')}\n\n"
-                "Введите исправленные данные в формате:\n"
-                "<code>Марка: Камаз\nМодель: 6520</code>",
-                reply_markup=get_cancel_keyboard()
-            )
-            await state.set_state(UserStates.waiting_for_field_correction)
-            await state.update_data(correcting_field="brand_model")
-            
-        elif message.text == "📅 Исправить год":
-            await reply(
-                message,
-                f"📅 <b>Текущий год:</b> {registration_result.get('year', 'не указан')}\n\n"
-                "Введите правильный год выпуска (4 цифры):",
-                reply_markup=get_cancel_keyboard()
-            )
-            await state.set_state(UserStates.waiting_for_field_correction)
-            await state.update_data(correcting_field="year")
-        
-        return
-    
-    if message.text == "🔄 Использовать Vision API":
-        # Пробуем использовать Vision API как запасной вариант
-        await reply(message, "👁️ <b>Использую Vision API для анализа...</b>")
-        
-        data = await state.get_data()
-        image_data = None
-        
-        # Пытаемся получить фото из состояния или запросить новое
-        if data.get('document_photo_id'):
-            try:
-                file = await bot.get_file(data['document_photo_id'])
-                photo_bytes = await bot.download_file(file.file_path)
-                image_data = await photo_bytes.read()
-            except:
-                pass
-        
-        if not image_data:
-            await reply(
-                message,
-                "📸 <b>Отправьте фото документа для анализа через Vision API</b>",
-                reply_markup=get_cancel_keyboard()
-            )
-            await state.set_state(UserStates.waiting_for_document_photo)
-            return
-        
-        # Анализируем через Vision API
-        vision_result = await vision_analyzer.analyze_document_text(image_data)
-        
-        if vision_result.get("success"):
-            # Парсим результат
-            document_type = data.get('document_type', 'СТС')
-            manual_data = registration_ai._parse_document_text_manually(
-                vision_result.get("extracted_text", ""),
-                document_type
-            )
-            
-            # Форматируем данные
-            registration_data = registration_ai._format_registration_data(manual_data)
-            registration_data["success"] = True
-            registration_data["registration_method"] = "vision_api_fallback"
-            registration_data["requires_manual_check"] = True
-            
-            await state.update_data(
-                registration_result=registration_data,
-                document_analysis={"extracted_text": vision_result.get("extracted_text", "")[:1000]}
-            )
-            
-            info_text = "👁️ <b>Анализ через Vision API завершен</b>\n\n"
-            info_text += f"<b>Качество:</b> Найдено {vision_result.get('total_blocks', 0)} блоков текста\n\n"
-            
-            if registration_data.get("vin"):
-                info_text += f"<b>VIN:</b> {registration_data['vin']}\n"
-            if registration_data.get("registration_number"):
-                info_text += f"<b>Госномер:</b> {registration_data['registration_number']}\n"
-            if registration_data.get("model"):
-                info_text += f"<b>Модель:</b> {registration_data['model']}\n"
-            if registration_data.get("brand"):
-                info_text += f"<b>Марка:</b> {registration_data['brand']}\n"
-            
-            info_text += "\n⚠️ <b>Требуется ручная проверка данных</b>"
-            
-            await reply(message, info_text, reply_markup=get_correction_keyboard())
-        else:
-            await reply(
-                message,
-                f"❌ <b>Vision API не смог проанализировать документ:</b>\n"
-                f"{vision_result.get('error', 'Неизвестная ошибка')}",
-                reply_markup=get_cancel_keyboard()
-            )
-        
-        return
-    
-    if message.text == "✅ Все верно, продолжить" or message.text == "✅ Подтвердить все данные":
-        # Переходим к следующему шагу
-        data = await state.get_data()
-        registration_result = data.get('registration_result', {})
-        
-        # Проверяем, есть ли имя для техники
         if registration_result.get('name'):
             await reply(
                 message,
-                f"🏷️ <b>Предлагаемое название техники:</b>\n{registration_result['name']}\n\n"
+                f"🏷️ <b>Предлагаемое название:</b> {registration_result['name']}\n\n"
                 "Вы можете оставить это название или ввести свое:",
-                reply_markup=types.ReplyKeyboardMarkup(
+                reply_markup=ReplyKeyboardMarkup(
                     keyboard=[
-                        [types.KeyboardButton(text=f"✅ Оставить: {registration_result['name'][:30]}")],
-                        [types.KeyboardButton(text="✏️ Ввести другое название")],
-                        [types.KeyboardButton(text="❌ Отмена")]
+                        [KeyboardButton(text=f"✅ Оставить: {registration_result['name'][:30]}")],
+                        [KeyboardButton(text="✏️ Ввести другое")],
+                        [KeyboardButton(text="❌ Отмена")]
                     ],
                     resize_keyboard=True
                 )
@@ -1682,7 +1256,7 @@ async def process_document_analysis_confirmation(message: types.Message, state: 
                 message,
                 "🏷️ <b>Введите название для техники:</b>\n\n"
                 "<i>Примеры:</i>\n"
-                "• Экскаватор №1\n• КАМАЗ-6520\n• Погрузчик Volvo\n• Синий кран",
+                "• Экскаватор №1\n• КАМАЗ-6520\n• Погрузчик Volvo",
                 reply_markup=get_cancel_keyboard()
             )
         
@@ -1690,7 +1264,7 @@ async def process_document_analysis_confirmation(message: types.Message, state: 
 
 @dp.message(UserStates.waiting_for_manual_correction)
 async def process_manual_correction(message: types.Message, state: FSMContext):
-    """Обрабатывает ручные правки данных"""
+    """Обрабатывает ручные правки"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = await db.get_user(message.from_user.id)
@@ -1714,23 +1288,18 @@ async def process_manual_correction(message: types.Message, state: FSMContext):
             field_map = {
                 'vin': 'vin',
                 'госномер': 'registration_number',
-                'номер': 'registration_number',
                 'марка': 'brand',
                 'модель': 'model',
                 'год': 'year',
                 'цвет': 'color',
-                'мощность': 'engine_power',
-                'категория': 'category',
-                'тип': 'category'
+                'мощность': 'engine_power'
             }
             
             for ru_key, en_key in field_map.items():
                 if ru_key in key:
-                    # Обработка специальных случаев
                     if en_key == 'year' and value.isdigit():
                         value = int(value)
                     elif en_key == 'engine_power':
-                        # Извлекаем число из строки
                         num_match = re.search(r'\d+', value)
                         if num_match:
                             value = int(num_match.group())
@@ -1748,76 +1317,15 @@ async def process_manual_correction(message: types.Message, state: FSMContext):
         ("🚗 Госномер", registration_result.get("registration_number")),
         ("🏷️ Марка", registration_result.get("brand")),
         ("🚜 Модель", registration_result.get("model")),
-        ("📅 Год выпуска", registration_result.get("year")),
-        ("🎨 Цвет", registration_result.get("color")),
     ]
     
     for label, value in fields:
         if value:
             info_text += f"<b>{label}:</b> {value}\n"
     
-    info_text += "\n<b>Продолжить с этими данными?</b>"
+    info_text += "\n<b>Продолжить?</b>"
     
     await reply(message, info_text, reply_markup=get_confirmation_keyboard())
-    await state.set_state(UserStates.waiting_for_document_analysis)
-
-@dp.message(UserStates.waiting_for_field_correction)
-async def process_field_correction(message: types.Message, state: FSMContext):
-    """Обрабатывает исправление конкретного поля"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        user = await db.get_user(message.from_user.id)
-        await reply(message, "❌ Регистрация отменена",
-                   reply_markup=get_main_keyboard(user['role'], user.get('organization_id')))
-        return
-    
-    data = await state.get_data()
-    registration_result = data.get('registration_result', {}).copy()
-    correcting_field = data.get('correcting_field')
-    
-    if correcting_field == 'vin':
-        # Проверяем VIN
-        vin = message.text.strip().upper()
-        if len(vin) == 17 and re.match(r'^[A-HJ-NPR-Z0-9]{17}$', vin):
-            registration_result['vin'] = vin
-        else:
-            await reply(message, "❌ Неверный формат VIN. Должно быть 17 символов (буквы и цифры)")
-            return
-    
-    elif correcting_field == 'registration_number':
-        registration_result['registration_number'] = message.text.strip().upper()
-    
-    elif correcting_field == 'brand_model':
-        text = message.text.strip()
-        lines = text.split('\n')
-        for line in lines:
-            if 'марка:' in line.lower():
-                registration_result['brand'] = line.split(':', 1)[1].strip()
-            elif 'модель:' in line.lower():
-                registration_result['model'] = line.split(':', 1)[1].strip()
-    
-    elif correcting_field == 'year':
-        year = message.text.strip()
-        if year.isdigit() and len(year) == 4:
-            year_int = int(year)
-            if 1950 <= year_int <= datetime.now().year + 1:
-                registration_result['year'] = year_int
-            else:
-                await reply(message, f"❌ Год должен быть между 1950 и {datetime.now().year + 1}")
-                return
-        else:
-            await reply(message, "❌ Введите 4 цифры года")
-            return
-    
-    await state.update_data(registration_result=registration_result)
-    
-    # Показываем обновленные данные
-    await reply(
-        message,
-        f"✅ <b>Поле исправлено!</b>\n\n"
-        f"Продолжайте исправлять другие поля или подтвердите все данные.",
-        reply_markup=get_correction_keyboard()
-    )
     await state.set_state(UserStates.waiting_for_document_analysis)
 
 @dp.message(UserStates.waiting_for_equipment_name)
@@ -1832,7 +1340,6 @@ async def process_equipment_name(message: types.Message, state: FSMContext):
     
     equipment_name = message.text
     
-    # Если пользователь выбрал "Оставить предложенное название"
     if equipment_name.startswith("✅ Оставить: "):
         equipment_name = equipment_name.replace("✅ Оставить: ", "")
     
@@ -1841,9 +1348,7 @@ async def process_equipment_name(message: types.Message, state: FSMContext):
     await reply(
         message,
         "⏱️ <b>Введите текущие моточасы техники:</b>\n\n"
-        "<i>Примеры:</i>\n"
-        "• 1250 моточасов\n• 2500\n• 500 (новый)\n\n"
-        "<b>Введите число:</b>",
+        "<i>Пример:</i> 1250",
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_motohours)
@@ -1859,7 +1364,6 @@ async def process_motohours(message: types.Message, state: FSMContext):
         return
     
     try:
-        # Извлекаем число из текста
         numbers = re.findall(r'\d+', message.text)
         if numbers:
             motohours = int(numbers[0])
@@ -1867,7 +1371,7 @@ async def process_motohours(message: types.Message, state: FSMContext):
             motohours = int(message.text)
         
         if motohours < 0 or motohours > 100000:
-            await reply(message, "❌ Введите разумное количество моточасов (0-100000)")
+            await reply(message, "❌ Введите разумное количество (0-100000)")
             return
         
         await state.update_data(motohours=motohours)
@@ -1875,12 +1379,8 @@ async def process_motohours(message: types.Message, state: FSMContext):
         await reply(
             message,
             "🛠️ <b>Введите информацию о последнем ТО:</b>\n\n"
-            "<i>Примеры:</i>\n"
-            "• Замена масла и фильтров 01.12.2023\n"
-            "• Полное ТО 1500 моточасов\n"
-            "• Новый, ТО не проводилось\n"
-            "• Ремонт гидравлики в ноябре\n\n"
-            "<b>Опишите последнее обслуживание:</b>",
+            "<i>Пример:</i>\n"
+            "Замена масла и фильтров 01.12.2023",
             reply_markup=get_cancel_keyboard()
         )
         await state.set_state(UserStates.waiting_for_last_service)
@@ -1910,13 +1410,12 @@ async def process_last_service(message: types.Message, state: FSMContext):
     # Формируем данные для регистрации
     vin = registration_result.get('vin')
     if not vin or vin.startswith('TEMP_'):
-        # Генерируем временный VIN
         vin = f"TEMP_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     
     # Добавляем технику в базу
     equipment_id = await db.add_equipment(
         name=equipment_name,
-        model=registration_result.get('model', 'Неизвестная модель'),
+        model=registration_result.get('model', 'Неизвестно'),
         vin=vin,
         org_id=user['organization_id'],
         registration_number=registration_result.get('registration_number', 'Без номера'),
@@ -1934,8 +1433,6 @@ async def process_last_service(message: types.Message, state: FSMContext):
             update_data['color'] = registration_result['color']
         if registration_result.get('engine_power'):
             update_data['engine_power'] = registration_result['engine_power']
-        if registration_result.get('category'):
-            update_data['category'] = registration_result['category']
         
         await db.update_equipment(equipment_id, **update_data)
         
@@ -1948,24 +1445,21 @@ async def process_last_service(message: types.Message, state: FSMContext):
         )
         
         # Сохраняем анализ документа
-        document_analysis = data.get('document_analysis', {})
-        if document_analysis:
-            await db.save_document_analysis({
-                "equipment_id": equipment_id,
-                "document_type": data.get('document_type', 'СТС'),
-                "analysis_data": registration_result,
-                "analysis_quality": registration_result.get('analysis_quality', 'unknown'),
-                "motohours": motohours,
-                "last_service": last_service,
-                "registration_date": datetime.now().strftime('%Y-%m-%d')
-            })
+        await db.save_document_analysis({
+            "equipment_id": equipment_id,
+            "document_type": data.get('document_type', 'СТС'),
+            "analysis_data": registration_result,
+            "analysis_quality": registration_result.get('analysis_quality', 'unknown'),
+            "motohours": motohours,
+            "last_service": last_service,
+            "registration_date": datetime.now().strftime('%Y-%m-%d')
+        })
         
         # Отправляем сообщение об успехе
         success_text = f"✅ <b>Техника успешно зарегистрирована!</b>\n\n"
         success_text += f"<b>ID техники:</b> {equipment_id}\n"
         success_text += f"<b>Название:</b> {equipment_name}\n"
         success_text += f"<b>Модель:</b> {registration_result.get('model', 'Неизвестно')}\n"
-        success_text += f"<b>Марка:</b> {registration_result.get('brand', 'Неизвестно')}\n"
         success_text += f"<b>VIN:</b> {vin}\n"
         success_text += f"<b>Госномер:</b> {registration_result.get('registration_number', 'Без номера')}\n"
         
@@ -1973,21 +1467,11 @@ async def process_last_service(message: types.Message, state: FSMContext):
             success_text += f"<b>Год выпуска:</b> {registration_result['year']}\n"
         
         success_text += f"<b>Моточасы:</b> {motohours}\n"
-        success_text += f"<b>Последнее ТО:</b> {last_service}\n\n"
-        
-        quality = registration_result.get('analysis_quality', 'unknown')
-        if quality == 'high':
-            success_text += "🟢 <b>Высокое качество анализа</b> - данные проверены\n"
-        elif quality == 'medium':
-            success_text += "🟡 <b>Среднее качество</b> - рекомендуется проверить\n"
-        elif quality == 'low':
-            success_text += "🔴 <b>Низкое качество</b> - требуется проверка данных\n"
-        
         success_text += "\n🚜 <b>Техника добавлена в ваш автопарк!</b>"
         
         await reply(message, success_text)
         
-        # Очищаем состояние и возвращаем в главное меню
+        # Очищаем состояние
         await state.clear()
         await reply(
             message,
@@ -1998,12 +1482,12 @@ async def process_last_service(message: types.Message, state: FSMContext):
     else:
         await reply(
             message,
-            "❌ Ошибка при сохранении техники в базу данных.",
+            "❌ Ошибка при сохранении техники.",
             reply_markup=get_main_keyboard(user['role'], user.get('organization_id'))
         )
         await state.clear()
 
-# ========== КОМАНДА ДЛЯ РУЧНОГО АНАЛИЗА ДОКУМЕНТА ==========
+# ========== КОМАНДА ДЛЯ РУЧНОГО АНАЛИЗА ==========
 @dp.message(Command("analyze_document"))
 async def cmd_analyze_document(message: types.Message, state: FSMContext):
     """Команда для ручного анализа документа"""
@@ -2016,18 +1500,13 @@ async def cmd_analyze_document(message: types.Message, state: FSMContext):
     await reply(
         message,
         "🔍 <b>Анализ документа СТС/ПТС</b>\n\n"
-        "Отправьте фото документа, и я извлеку из него всю информацию.\n\n"
-        "<b>Поддерживаемые документы:</b>\n"
-        "• СТС (Свидетельство о регистрации)\n"
-        "• ПТС (Паспорт транспортного средства)\n"
-        "• ПСМ (Паспорт самоходной машины)\n\n"
-        "<b>Отправьте фото документа:</b>",
+        "Отправьте фото документа для анализа.\n\n"
+        "<b>Отправьте фото:</b>",
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(UserStates.waiting_for_document_photo)
-    await state.update_data(manual_analysis=True)
 
-# ========== КОМАНДА ДЛЯ ПРОВЕРКИ СТАТУСА CLOUD FUNCTION ==========
+# ========== КОМАНДА ДЛЯ ПРОВЕРКИ СТАТУСА ==========
 @dp.message(Command("check_cf_status"))
 async def cmd_check_cf_status(message: types.Message):
     """Проверяет статус Cloud Function"""
@@ -2040,22 +1519,7 @@ async def cmd_check_cf_status(message: types.Message):
     
     status_text = "🔧 <b>Статус Cloud Function</b>\n\n"
     status_text += f"<b>Включена:</b> {'✅ Да' if config['enabled'] else '❌ Нет'}\n"
-    status_text += f"<b>URL:</b> <code>{config['function_url']}</code>\n"
-    status_text += f"<b>Таймаут:</b> {config['timeout']} сек\n"
-    status_text += f"<b>Повторные попытки:</b> {config['max_retries']}\n\n"
-    
-    # Пробуем отправить тестовый запрос
-    if config['function_url']:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(config['function_url'], timeout=10) as response:
-                    status_text += f"<b>HTTP статус:</b> {response.status}\n"
-                    if response.status == 200:
-                        status_text += "🟢 <b>Функция доступна</b>\n"
-                    else:
-                        status_text += f"🔴 <b>Проблема: {response.status}</b>\n"
-        except Exception as e:
-            status_text += f"🔴 <b>Ошибка подключения:</b> {str(e)}\n"
+    status_text += f"<b>URL:</b> {config['function_url']}\n"
     
     await reply(message, status_text)
 
@@ -2076,7 +1540,7 @@ async def all_users(message: types.Message):
     
     text = "👥 <b>Все пользователи</b>\n\n"
     
-    for u in users[:15]:
+    for u in users[:10]:
         role_emoji = {
             'botadmin': '👑',
             'director': '👨‍💼',
@@ -2087,13 +1551,7 @@ async def all_users(message: types.Message):
         
         text += f"{role_emoji} <b>{u['full_name']}</b>\n"
         text += f"ID: <code>{u['telegram_id']}</code>\n"
-        text += f"Роль: {u['role']}\n"
-        if u.get('organization_id'):
-            text += f"Организация ID: {u['organization_id']}\n"
-        text += "\n"
-    
-    if len(users) > 15:
-        text += f"<i>... и еще {len(users) - 15} пользователей</i>"
+        text += f"Роль: {u['role']}\n\n"
     
     await reply(message, text)
 
@@ -2115,10 +1573,7 @@ async def all_organizations(message: types.Message):
     
     for org in organizations:
         text += f"<b>ID:</b> {org['id']}\n"
-        text += f"<b>Название:</b> {org['name']}\n"
-        if org.get('director_id'):
-            text += f"<b>Директор ID:</b> {org['director_id']}\n"
-        text += "\n"
+        text += f"<b>Название:</b> {org['name']}\n\n"
     
     await reply(message, text)
 
@@ -2130,34 +1585,11 @@ async def ai_settings(message: types.Message):
         await reply(message, "⛔ Доступ только для администратора!")
         return
     
-    text = "⚙️ <b>Настройки ИИ-модулей</b>\n\n"
+    text = "⚙️ <b>Настройки ИИ</b>\n\n"
     
-    for module_name, config in AI_CONFIG.items():
-        if module_name == AIModule.DOCUMENT_ANALYSIS:
-            status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
-            has_url = "✅" if config.get('function_url') else "❌"
-            
-            text += f"<b>📄 Анализ документов (Cloud Function):</b>\n"
-            text += f"Статус: {status}\n"
-            text += f"URL: {has_url}\n"
-            text += f"Таймаут: {config.get('timeout', 60)}с\n"
-            text += f"Повторы: {config.get('max_retries', 3)}\n\n"
-        else:
-            status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
-            has_key = "✅" if config.get('api_key') else "❌"
-            
-            text += f"<b>{module_name.value}:</b>\n"
-            text += f"Статус: {status}\n"
-            text += f"API ключ: {has_key}\n\n"
-    
+    text += f"<b>Анализ документов:</b> {'✅ ВКЛ' if AI_CONFIG[AIModule.DOCUMENT_ANALYSIS]['enabled'] else '❌ ВЫКЛ'}\n"
     text += f"<b>Vision API:</b> {'✅ ВКЛ' if VISION_ENABLED else '❌ ВЫКЛ'}\n"
-    text += f"<b>API ключ Vision:</b> {'✅' if VISION_API_KEY else '❌'}\n"
-    text += f"<b>Folder ID Vision:</b> {'✅' if VISION_FOLDER_ID else '❌'}\n\n"
-    
     text += f"<b>Всего промптов:</b> {len(PROMPTS)}\n"
-    text += f"<b>Доступные промпты:</b> {', '.join(PROMPTS.keys())}\n\n"
-    
-    text += "<i>Для изменения настроек отредактируйте .env файл</i>"
     
     await reply(message, text)
 
@@ -2180,18 +1612,7 @@ async def on_startup():
             )
             logger.info(f"✅ Администратор создан: ID {ADMIN_ID}")
         
-        # Проверяем настройки ИИ
         logger.info("🚀 Бот запущен!")
-        logger.info(f"🤖 Анализ документов: {'✅ ВКЛ' if AI_CONFIG[AIModule.DOCUMENT_ANALYSIS]['enabled'] else '❌ ВЫКЛ'}")
-        logger.info(f"👑 Администратор: ID {ADMIN_ID}")
-        logger.info(f"📝 Загружено промптов: {len(PROMPTS)}")
-        
-        # Проверяем конфигурацию Cloud Function
-        cf_config = AI_CONFIG[AIModule.DOCUMENT_ANALYSIS]
-        if cf_config['enabled'] and cf_config['function_url']:
-            logger.info(f"🔗 Cloud Function URL: {cf_config['function_url']}")
-        else:
-            logger.warning("⚠️ Cloud Function не настроена или отключена")
         
     except Exception as e:
         logger.error(f"❌ Ошибка запуска: {e}")
